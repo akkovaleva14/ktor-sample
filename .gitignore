@@ -38,3 +38,7 @@ out/
 .DS_Store
 .kotlin/
 local.properties
+.git
+.build
+.kotlin
+build
