@@ -9,6 +9,10 @@ import io.ktor.server.routing.*
 
 fun Application.configureRouting(llm: LlmClient) {
     routing {
+        head("/") {
+            call.respond(HttpStatusCode.OK)
+        }
+
         get("/") {
             call.respondText("OK")
         }
