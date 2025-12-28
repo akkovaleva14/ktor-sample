@@ -1,16 +1,12 @@
 # ---- Build stage ----
-FROM eclipse-temurin:21-jdk AS build
+FROM eclipse-temurin:17-jdk AS build
 WORKDIR /app
 
-# Сначала копируем файлы сборки — так лучше кешируется
 COPY gradlew .
 COPY gradle/ gradle/
 COPY build.gradle.kts settings.gradle.kts gradle.properties ./
-
-# Потом исходники
 COPY src/ src/
 
-# Собираем fat jar (shadowJar)
 RUN chmod +x ./gradlew && ./gradlew clean shadowJar --no-daemon
 
 # ---- Run stage ----
