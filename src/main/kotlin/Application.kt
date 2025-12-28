@@ -16,6 +16,7 @@ import io.ktor.server.plugins.requestvalidation.*
 import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import kotlinx.serialization.json.Json
+import java.io.File
 import java.util.UUID
 
 fun main() {
@@ -156,29 +157,40 @@ fun Application.module(llmOverride: LlmClient? = null) {
     val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
     log.info("LLM_PROVIDER=$provider")
 
-    // Отдельный клиент для GigaChat, чтобы на macOS корректно доверять PEM (как curl --cacert)
     val gigaHttp: HttpClient? = run {
         if (provider != "gigachat") {
             log.info("GigaChat client disabled (provider=$provider)")
             return@run null
         }
 
-        val pemPath = System.getenv("GIGACHAT_CA_PEM") ?: "/tmp/ngw-cert-3.pem"
-        log.info("GigaChat TLS PEM path: $pemPath")
+        val pemPathEnv = System.getenv("GIGACHAT_CA_PEM") // <-- важно: без дефолта
+        val pemFile = pemPathEnv?.let { File(it) }
 
-        val tm = try {
-            TlsPemTrust.trustManagerFromPemFile(pemPath)
-        } catch (e: Throwable) {
-            log.error("Failed to load PEM trust manager from: $pemPath", e)
-            throw e
+        if (pemFile != null) {
+            log.info("GigaChat TLS PEM path: ${pemFile.path} (exists=${pemFile.exists()})")
+        } else {
+            log.info("GigaChat TLS PEM path is not set (GIGACHAT_CA_PEM is empty). Using system trust store.")
         }
 
-        log.info("GigaChat HttpClient(CIO) with custom trustManager created")
+        val tm = if (pemFile != null && pemFile.exists()) {
+            try {
+                TlsPemTrust.trustManagerFromPemFile(pemFile.path)
+            } catch (e: Throwable) {
+                log.error("Failed to load PEM trust manager from: ${pemFile.path}. Falling back to system trust store.", e)
+                null
+            }
+        } else null
 
-        HttpClient(CIO) {
-            install(ClientContentNegotiation) { json(clientJson) }
-            engine {
-                https { trustManager = tm }
+        if (tm != null) {
+            log.info("GigaChat HttpClient(CIO) with custom trustManager created")
+            HttpClient(CIO) {
+                install(ClientContentNegotiation) { json(clientJson) }
+                engine { https { trustManager = tm } }
+            }
+        } else {
+            log.info("GigaChat HttpClient(CIO) with system trust store created")
+            HttpClient(CIO) {
+                install(ClientContentNegotiation) { json(clientJson) }
             }
         }
     }
