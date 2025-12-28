@@ -44,6 +44,9 @@ fun main() {
 fun Application.module(llmOverride: LlmClient? = null) {
     val log = this.log
 
+    // Для /health и простого uptime
+    attributes.put(AppAttributes.StartedAtMs, System.currentTimeMillis())
+
     install(CallId) {
         header(HttpHeaders.XRequestId)
         generate { UUID.randomUUID().toString() }
@@ -285,7 +288,11 @@ fun Application.module(llmOverride: LlmClient? = null) {
 
             caPemPath.isNotEmpty() -> {
                 val f = File(caPemPath)
-                log.info("GigaChat CA path provided (path=${f.path}, exists=${f.exists()}, size=${if (f.exists()) f.length() else 0})")
+                log.info(
+                    "GigaChat CA path provided (path=${f.path}, exists=${f.exists()}, size=${
+                        if (f.exists()) f.length() else 0
+                    })"
+                )
                 if (f.exists()) f else null
             }
 
@@ -299,7 +306,10 @@ fun Application.module(llmOverride: LlmClient? = null) {
             try {
                 TlsPemTrust.trustManagerFromPemFile(pemFile.path)
             } catch (e: Throwable) {
-                log.error("Failed to load PEM trust manager from file: ${pemFile.path}. Falling back to system trust store.", e)
+                log.error(
+                    "Failed to load PEM trust manager from file: ${pemFile.path}. Falling back to system trust store.",
+                    e
+                )
                 null
             }
         } else null

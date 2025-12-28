@@ -2,6 +2,7 @@ package com.example
 
 import io.ktor.http.*
 import io.ktor.server.application.*
+import io.ktor.server.plugins.callid.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -13,6 +14,9 @@ import io.ktor.server.routing.*
  * 1) vocabUsed/vocabMissing считаются по всей сессии (по всем student-сообщениям).
  * 2) POST /messages поддерживает идемпотентность по заголовку Idempotency-Key:
  *    повторный запрос с тем же ключом вернёт тот же ответ без дублей в истории.
+ * 3) Rate limit: in-memory ограничения по IP/сессии, чтобы не "сжигать" LLM.
+ * 4) Teacher auth: создание заданий закрыто Bearer-токеном.
+ * 5) Наблюдаемость: логируем latency LLM-вызовов + uptime в /health.
  */
 fun Application.configureRouting(llm: LlmClient) {
     routing {
@@ -20,10 +24,15 @@ fun Application.configureRouting(llm: LlmClient) {
         get("/") { call.respondText("OK") }
 
         get("/health") {
+            val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
+            val startedAt = application.attributes.getOrNull(AppAttributes.StartedAtMs) ?: System.currentTimeMillis()
+            val uptimeSec = ((System.currentTimeMillis() - startedAt) / 1000).coerceAtLeast(0)
+
             call.respond(
                 mapOf(
                     "status" to "ok",
-                    "provider" to (System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama")
+                    "provider" to provider,
+                    "uptimeSec" to uptimeSec
                 )
             )
         }
@@ -32,7 +41,13 @@ fun Application.configureRouting(llm: LlmClient) {
 
             get("/llm/ping") {
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
+                val t0 = System.nanoTime()
                 val text = llm.generateOpener(topic = "Ping", vocab = listOf("hello"), level = null)
+                val tookMs = (System.nanoTime() - t0) / 1_000_000
+
+                application.log.info(
+                    "llm.generateOpener ok requestId=${call.callId} provider=$provider tookMs=$tookMs"
+                )
 
                 call.respond(
                     mapOf(
@@ -44,6 +59,29 @@ fun Application.configureRouting(llm: LlmClient) {
             }
 
             post("/assignments") {
+                // rate limit: teacher endpoint (по IP)
+                val ip = call.clientIp()
+                val rlOk = RateLimiter.allow(
+                    key = "v1.assignments.create.ip=$ip",
+                    policy = RateLimiter.Policy(limit = 10, windowMs = 60_000)
+                )
+                if (!rlOk) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        ApiErrorEnvelope(ApiError(ApiErrorCodes.RATE_LIMIT, "Too many requests"))
+                    )
+                    return@post
+                }
+
+                // auth: teacher token
+                if (!TeacherAuth.isAllowed(call)) {
+                    call.respond(
+                        HttpStatusCode.Unauthorized,
+                        ApiErrorEnvelope(ApiError(ApiErrorCodes.AUTH_ERROR, "Unauthorized"))
+                    )
+                    return@post
+                }
+
                 val req = call.receive<CreateAssignmentReq>()
                 val assignment = AssignmentStore.create(
                     topic = req.topic.trim(),
@@ -90,6 +128,20 @@ fun Application.configureRouting(llm: LlmClient) {
             }
 
             post("/sessions/open") {
+                // rate limit: вход в сессию по joinKey (по IP)
+                val ip = call.clientIp()
+                val rlOk = RateLimiter.allow(
+                    key = "v1.sessions.open.ip=$ip",
+                    policy = RateLimiter.Policy(limit = 30, windowMs = 60_000)
+                )
+                if (!rlOk) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        ApiErrorEnvelope(ApiError(ApiErrorCodes.RATE_LIMIT, "Too many requests"))
+                    )
+                    return@post
+                }
+
                 val req = call.receive<OpenSessionReq>()
                 val joinKey = req.joinKey.trim().uppercase()
 
@@ -109,6 +161,8 @@ fun Application.configureRouting(llm: LlmClient) {
 
                 val session = SessionStore.createFromAssignment(a)
 
+                val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
+                val t0 = System.nanoTime()
                 val opener = llm.generateOpener(
                     topic = session.topic,
                     vocab = session.vocab,
@@ -116,6 +170,11 @@ fun Application.configureRouting(llm: LlmClient) {
                 ).ifBlank {
                     "Let’s start with something simple—what comes to mind first?"
                 }
+                val tookMs = (System.nanoTime() - t0) / 1_000_000
+
+                application.log.info(
+                    "llm.generateOpener ok requestId=${call.callId} sessionId=${session.id} provider=$provider tookMs=$tookMs"
+                )
 
                 session.messages += Msg(role = "tutor", content = opener)
 
@@ -134,6 +193,20 @@ fun Application.configureRouting(llm: LlmClient) {
             post("/sessions/{id}/messages") {
                 val sessionId = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
+
+                // rate limit: основной "дорогой" эндпойнт (по IP+session)
+                val ip = call.clientIp()
+                val rlOk = RateLimiter.allow(
+                    key = "v1.sessions.messages.ip=$ip.session=$sessionId",
+                    policy = RateLimiter.Policy(limit = 60, windowMs = 60_000)
+                )
+                if (!rlOk) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        ApiErrorEnvelope(ApiError(ApiErrorCodes.RATE_LIMIT, "Too many requests"))
+                    )
+                    return@post
+                }
 
                 val session = SessionStore.get(sessionId)
                     ?: run {
@@ -185,9 +258,9 @@ fun Application.configureRouting(llm: LlmClient) {
                         .filter { it.role == "student" }
                         .joinToString("\n") { it.content }
 
-                    val coverage = computeVocabCoverage(studentCorpus, session.vocab)
-                    usedEver = coverage.first
-                    missingEver = coverage.second
+                    val (used, missing) = computeVocabCoverage(studentCorpus, session.vocab)
+                    usedEver = used
+                    missingEver = missing
 
                     studentTurns = session.messages.count { it.role == "student" }
                 }
@@ -199,11 +272,19 @@ fun Application.configureRouting(llm: LlmClient) {
                 }
 
                 // 3) Вне лока: вызываем LLM (suspend, может быть долгим).
+                val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
+                val t0 = System.nanoTime()
+
                 val tutorTextFromLlm = llm.tutorReply(
                     session = session,
                     studentText = studentText,
                     used = usedEver,
                     missing = missingEver
+                )
+
+                val tookMs = (System.nanoTime() - t0) / 1_000_000
+                application.log.info(
+                    "llm.tutorReply ok requestId=${call.callId} sessionId=$sessionId provider=$provider tookMs=$tookMs"
                 )
 
                 val shouldShowHint = missingEver.isNotEmpty() && studentTurns >= 2
