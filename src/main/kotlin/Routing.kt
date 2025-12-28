@@ -2,22 +2,48 @@ package com.example
 
 import io.ktor.http.*
 import io.ktor.server.application.*
-import io.ktor.server.plugins.requestvalidation.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 
 fun Application.configureRouting(llm: LlmClient) {
     routing {
-        head("/") {
-            call.respond(HttpStatusCode.OK)
-        }
+        // Render / proxies may send HEAD /
+        head("/") { call.respond(HttpStatusCode.OK) }
 
-        get("/") {
-            call.respondText("OK")
+        get("/") { call.respondText("OK") }
+
+        // Fast healthcheck: does NOT call LLM
+        get("/health") {
+            call.respond(
+                mapOf(
+                    "status" to "ok",
+                    "provider" to (System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama")
+                )
+            )
         }
 
         route("/v1") {
+
+            // Fast LLM check: DOES call LLM
+            // Useful to confirm secrets/network/auth/TLS are OK on Render
+            get("/llm/ping") {
+                val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
+
+                val text = llm.generateOpener(
+                    topic = "Ping",
+                    vocab = listOf("hello"),
+                    level = null
+                )
+
+                call.respond(
+                    mapOf(
+                        "status" to "ok",
+                        "provider" to provider,
+                        "sample" to text.take(200)
+                    )
+                )
+            }
 
             // --------------------------
             // TEACHER: create assignment
