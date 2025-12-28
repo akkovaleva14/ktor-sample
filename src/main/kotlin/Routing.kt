@@ -25,7 +25,14 @@ fun Application.configureRouting(llm: LlmClient) {
 
         get("/health") {
             val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
-            val startedAt = application.attributes.getOrNull(AppAttributes.StartedAtMs) ?: System.currentTimeMillis()
+
+            val startedAt = runCatching {
+                application.attributes[AppAttributes.StartedAtMs]
+            }.getOrElse {
+                // Если атрибут не установлен/недоступен — не падаем
+                System.currentTimeMillis()
+            }
+
             val uptimeSec = ((System.currentTimeMillis() - startedAt) / 1000).coerceAtLeast(0)
 
             call.respond(
