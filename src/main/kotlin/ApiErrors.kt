@@ -14,6 +14,12 @@ object ApiErrorCodes {
     const val ASSIGNMENT_NOT_FOUND = "assignment_not_found"
     const val INVALID_JOIN_KEY = "invalid_join_key"
 
+    // Upstream / networking
+    const val UPSTREAM_ERROR = "upstream_error"
+    const val RATE_LIMIT = "rate_limit"
+    const val AUTH_ERROR = "auth_error"
+    const val TIMEOUT = "timeout"
+
     const val INTERNAL_ERROR = "internal_error"
 }
 

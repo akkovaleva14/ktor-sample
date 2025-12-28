@@ -8,12 +8,9 @@ import io.ktor.server.routing.*
 
 fun Application.configureRouting(llm: LlmClient) {
     routing {
-        // Render / proxies may send HEAD /
         head("/") { call.respond(HttpStatusCode.OK) }
-
         get("/") { call.respondText("OK") }
 
-        // Fast healthcheck: does NOT call LLM
         get("/health") {
             call.respond(
                 mapOf(
@@ -25,16 +22,9 @@ fun Application.configureRouting(llm: LlmClient) {
 
         route("/v1") {
 
-            // Fast LLM check: DOES call LLM
-            // Useful to confirm secrets/network/auth/TLS are OK on Render
             get("/llm/ping") {
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
-
-                val text = llm.generateOpener(
-                    topic = "Ping",
-                    vocab = listOf("hello"),
-                    level = null
-                )
+                val text = llm.generateOpener(topic = "Ping", vocab = listOf("hello"), level = null)
 
                 call.respond(
                     mapOf(
@@ -45,9 +35,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 )
             }
 
-            // --------------------------
-            // TEACHER: create assignment
-            // --------------------------
             post("/assignments") {
                 val req = call.receive<CreateAssignmentReq>()
                 val assignment = AssignmentStore.create(
@@ -94,9 +81,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 )
             }
 
-            // --------------------------
-            // STUDENT: open session by joinKey
-            // --------------------------
             post("/sessions/open") {
                 val req = call.receive<OpenSessionReq>()
                 val joinKey = req.joinKey.trim().uppercase()
@@ -117,7 +101,6 @@ fun Application.configureRouting(llm: LlmClient) {
 
                 val session = SessionStore.createFromAssignment(a)
 
-                // LLM generates a gentle opener based on topic + vocab
                 val opener = llm.generateOpener(
                     topic = session.topic,
                     vocab = session.vocab,
@@ -140,9 +123,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 )
             }
 
-            // --------------------------
-            // CHAT: student sends message
-            // --------------------------
             post("/sessions/{id}/messages") {
                 val sessionId = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
@@ -166,34 +146,35 @@ fun Application.configureRouting(llm: LlmClient) {
 
                 session.messages += Msg(role = "student", content = studentText)
 
-                val (used, missing) = computeVocabCoverage(studentText, session.vocab)
+                // coverage for latest message
+                val (usedLatest, missingLatest) = computeVocabCoverage(studentText, session.vocab)
+
+                // coverage across ALL student turns (avoid silly hints like "wake" after it was used earlier)
+                val studentCorpus = session.messages
+                    .asSequence()
+                    .filter { it.role == "student" }
+                    .joinToString("\n") { it.content }
+
+                val (usedEver, _) = computeVocabCoverage(studentCorpus, session.vocab)
+                val missingEver = session.vocab.filterNot { v -> usedEver.any { it.equals(v, ignoreCase = true) } }
 
                 val tutorTextFromLlm = llm.tutorReply(
                     session = session,
                     studentText = studentText,
-                    used = used,
-                    missing = missing
+                    used = usedLatest,
+                    missing = missingLatest
                 )
 
-                // Hint policy: do NOT show immediately.
-                // Show only after the student has had at least 2 turns and still misses vocab.
                 val studentTurns = session.messages.count { it.role == "student" }
-                val shouldShowHint = missing.isNotEmpty() && studentTurns >= 2
+                val shouldShowHint = missingEver.isNotEmpty() && studentTurns >= 2
+
+                val hint = if (shouldShowHint) pickHint(missingEver) else null
 
                 val tutor = TutorMessageResp(
                     tutorText = tutorTextFromLlm,
-                    hint = if (shouldShowHint) {
-                        missing.firstOrNull()?.let { w ->
-                            when (w.lowercase()) {
-                                "however" -> "Try: \"I liked it. However, ...\""
-                                "because" -> "Try: \"... because ...\""
-                                "recommend" -> "Try: \"I recommend ...\""
-                                else -> "Try to use: $w"
-                            }
-                        }
-                    } else null,
-                    vocabUsed = used,
-                    vocabMissing = missing
+                    hint = hint,
+                    vocabUsed = usedLatest,
+                    vocabMissing = missingLatest
                 )
 
                 session.messages += Msg(role = "tutor", content = tutor.tutorText)
@@ -201,9 +182,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 call.respond(tutor)
             }
 
-            // --------------------------
-            // HISTORY
-            // --------------------------
             get("/sessions/{id}") {
                 val sessionId = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
@@ -234,9 +212,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 )
             }
 
-            // --------------------------
-            // LIST SESSIONS (admin/debug)
-            // --------------------------
             get("/sessions") {
                 val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 20
                 val offset = call.request.queryParameters["offset"]?.toIntOrNull() ?: 0
@@ -258,9 +233,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 call.respond(ListSessionsResp(items = items, limit = limit, offset = offset))
             }
 
-            // --------------------------
-            // DELETE SESSION
-            // --------------------------
             delete("/sessions/{id}") {
                 val sessionId = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
@@ -282,9 +254,6 @@ fun Application.configureRouting(llm: LlmClient) {
                 call.respond(HttpStatusCode.NoContent)
             }
 
-            // --------------------------
-            // FALLBACK: unknown /v1/* routes
-            // --------------------------
             route("{...}") {
                 handle {
                     call.respond(
@@ -302,14 +271,64 @@ fun Application.configureRouting(llm: LlmClient) {
     }
 }
 
+/**
+ * Phrase-aware vocab coverage:
+ * - single word vocab: token match
+ * - multi-word vocab (contains space): substring match on normalized text with word boundaries-ish behavior
+ */
 private fun computeVocabCoverage(text: String, vocab: List<String>): Pair<List<String>, List<String>> {
-    val tokens = text
-        .lowercase()
-        .split(Regex("""[^a-z']+"""))
+    val normalized = normalizeForMatch(text)
+
+    val tokens = normalized
+        .split(Regex("""[^a-z0-9']+"""))
         .filter { it.isNotBlank() }
         .toSet()
 
-    val used = vocab.filter { it.lowercase() in tokens }
-    val missing = vocab.filterNot { it.lowercase() in tokens }
+    fun containsPhrase(phrase: String): Boolean {
+        val p = normalizeForMatch(phrase)
+        if (p.isBlank()) return false
+
+        // crude but effective boundaries: pad with spaces
+        val hay = " $normalized "
+        val needle = " $p "
+        return hay.contains(needle)
+    }
+
+    val used = vocab.filter { v ->
+        val vv = v.trim()
+        if (vv.contains(" ")) containsPhrase(vv) else normalizeForMatch(vv) in tokens
+    }
+
+    val missing = vocab.filterNot { v -> used.any { it.equals(v, ignoreCase = true) } }
     return used to missing
+}
+
+private fun normalizeForMatch(s: String): String {
+    return s.lowercase()
+        .replace(Regex("""\s+"""), " ")
+        .replace(Regex("""[^a-z0-9' ]+"""), " ")
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+}
+
+/**
+ * Prioritized hint selection:
+ * - connectors first (because/however/recommend)
+ * - then other items
+ */
+private fun pickHint(missingEver: List<String>): String? {
+    if (missingEver.isEmpty()) return null
+
+    val priority = listOf("because", "however", "recommend")
+    val chosen = missingEver.minByOrNull { w ->
+        val idx = priority.indexOf(w.trim().lowercase())
+        if (idx >= 0) idx else 999
+    } ?: return null
+
+    return when (chosen.trim().lowercase()) {
+        "however" -> "Try: \"I liked it. However, ...\""
+        "because" -> "Try: \"... because ...\""
+        "recommend" -> "Try: \"I recommend ...\""
+        else -> "Try to use: $chosen"
+    }
 }

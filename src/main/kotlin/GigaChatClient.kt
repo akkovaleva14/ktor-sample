@@ -4,7 +4,6 @@ import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -52,10 +51,13 @@ class GigaChatClient(
             if (!level.isNullOrBlank()) appendLine("Student level: $level")
         }.trim()
 
-        return chat(listOf(
-            ChatMessage("system", system),
-            ChatMessage("user", user)
-        ), temperature = 0.4).ifBlank {
+        return chat(
+            listOf(
+                ChatMessage("system", system),
+                ChatMessage("user", user)
+            ),
+            temperature = 0.4
+        ).ifBlank {
             "Let’s start with something simple—what comes to mind first?"
         }
     }
@@ -111,7 +113,12 @@ class GigaChatClient(
 
         val raw = resp.bodyAsText()
         if (!resp.status.isSuccess()) {
-            throw IllegalStateException("GigaChat chat failed: HTTP ${resp.status.value} body=$raw")
+            throw UpstreamException(
+                upstream = "gigachat-chat",
+                status = resp.status,
+                bodySnippet = raw.snip(800),
+                message = "GigaChat chat failed: HTTP ${resp.status.value}"
+            )
         }
 
         val parsed = json.decodeFromString(ChatCompletionResp.serializer(), raw)

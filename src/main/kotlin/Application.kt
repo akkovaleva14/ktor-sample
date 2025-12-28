@@ -2,7 +2,7 @@ package com.example
 
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation as ClientContentNegotiation
+import io.ktor.client.plugins.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -20,6 +20,8 @@ import java.io.File
 import java.util.Base64
 import java.util.UUID
 import kotlin.io.path.createTempFile
+import kotlin.time.Duration.Companion.seconds
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation as ClientContentNegotiation
 
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
@@ -102,6 +104,50 @@ fun Application.module(llmOverride: LlmClient? = null) {
             )
         }
 
+        // ⏱ Timeouts (Ktor client)
+        exception<HttpRequestTimeoutException> { call, cause ->
+            log.warn("Upstream timeout. requestId=${call.callId}. ${cause.message}")
+            call.respond(
+                HttpStatusCode.GatewayTimeout,
+                ApiErrorEnvelope(
+                    ApiError(
+                        code = ApiErrorCodes.TIMEOUT,
+                        message = "Upstream timeout"
+                    )
+                )
+            )
+        }
+
+        // 🌐 Typed upstream errors
+        exception<UpstreamException> { call, cause ->
+            val (status, code) = when {
+                cause.status == HttpStatusCode.TooManyRequests -> HttpStatusCode.TooManyRequests to ApiErrorCodes.RATE_LIMIT
+                cause.status == HttpStatusCode.Unauthorized || cause.status == HttpStatusCode.Forbidden ->
+                    HttpStatusCode.BadGateway to ApiErrorCodes.AUTH_ERROR
+                cause.status.value in 500..599 -> HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
+                else -> HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
+            }
+
+            // Безопасно: не логируем секреты, только статус/сниппет
+            log.warn(
+                "UpstreamException. requestId=${call.callId} upstream=${cause.upstream} status=${cause.status.value} bodySnippet=${cause.bodySnippet.orEmpty()}"
+            )
+
+            call.respond(
+                status,
+                ApiErrorEnvelope(
+                    ApiError(
+                        code = code,
+                        message = "Upstream error (${cause.upstream})",
+                        details = buildMap {
+                            put("upstreamStatus", cause.status.value.toString())
+                            if (!cause.bodySnippet.isNullOrBlank()) put("body", cause.bodySnippet)
+                        }
+                    )
+                )
+            )
+        }
+
         exception<Throwable> { call, cause ->
             log.error("Unhandled exception. requestId=${call.callId}", cause)
             call.respond(
@@ -148,12 +194,49 @@ fun Application.module(llmOverride: LlmClient? = null) {
         }
     }
 
-    // Общий JSON-конфиг для клиентов
     val clientJson = Json { ignoreUnknownKeys = true }
 
-    // Клиент "по умолчанию" (годится для Ollama http://localhost)
-    val llmHttp = HttpClient(CIO) {
+    fun HttpClientConfig<CIOEngineConfig>.installCommonClientHardening(name: String) {
         install(ClientContentNegotiation) { json(clientJson) }
+
+        // ⏱ Timeouts: conservative defaults for LLM calls
+        install(HttpTimeout) {
+            connectTimeoutMillis = 5.seconds.inWholeMilliseconds
+            socketTimeoutMillis = 20.seconds.inWholeMilliseconds
+            requestTimeoutMillis = 25.seconds.inWholeMilliseconds
+        }
+
+        // 🔁 Retries: only for transient issues
+        install(HttpRequestRetry) {
+            maxRetries = 2
+            retryIf { _, response ->
+                response.status == HttpStatusCode.TooManyRequests ||
+                        response.status == HttpStatusCode.BadGateway ||
+                        response.status == HttpStatusCode.ServiceUnavailable ||
+                        response.status == HttpStatusCode.GatewayTimeout ||
+                        response.status.value in 500..599
+            }
+            retryOnExceptionIf { _, cause ->
+                cause is HttpRequestTimeoutException ||
+                        cause is java.net.SocketTimeoutException ||
+                        cause is java.io.IOException
+            }
+            // small exponential-ish backoff (keep it simple and bounded)
+            delayMillis { retry -> (200L * (retry + 1)).coerceAtMost(800L) }
+            modifyRequest { request ->
+                // helps with tracing retry waves (no secrets)
+                request.headers.append("X-Retry-Attempt", retryCount.toString())
+                request.headers.append("X-Client-Name", name)
+            }
+        }
+
+        // Avoid throwing exceptions for non-2xx automatically
+        expectSuccess = false
+    }
+
+    // Default client (Ollama / local)
+    val llmHttp = HttpClient(CIO) {
+        installCommonClientHardening(name = "llm-default")
     }
 
     val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
@@ -165,10 +248,6 @@ fun Application.module(llmOverride: LlmClient? = null) {
             return@run null
         }
 
-        // Новый контракт переменных:
-        // - GIGACHAT_CA_PEM: PEM-текст (multi-line)  <-- для Render
-        // - GIGACHAT_CA_PEM_B64: PEM-текст в base64 (одна строка) (опционально)
-        // - GIGACHAT_CA_PEM_PATH: путь к файлу (опционально)
         val caPemEnv = System.getenv("GIGACHAT_CA_PEM")?.trim().orEmpty()
         val caPemB64 = System.getenv("GIGACHAT_CA_PEM_B64")?.trim().orEmpty()
         val caPemPath = System.getenv("GIGACHAT_CA_PEM_PATH")?.trim().orEmpty()
@@ -187,27 +266,22 @@ fun Application.module(llmOverride: LlmClient? = null) {
             else -> ""
         }
 
-        // Готовим файл, который реально существует (если есть PEM-текст или задан путь)
         val pemFile: File? = when {
             pemText.contains("BEGIN CERTIFICATE") -> {
                 val tmp = createTempFile(prefix = "gigachat-ca-", suffix = ".pem").toFile()
                 tmp.writeText(pemText + if (pemText.endsWith("\n")) "" else "\n")
-                log.info(
-                    "GigaChat CA loaded from ENV (tempFile=${tmp.absolutePath}, exists=${tmp.exists()}, size=${tmp.length()})"
-                )
+                log.info("GigaChat CA loaded from ENV (exists=${tmp.exists()}, size=${tmp.length()})")
                 tmp
             }
 
             caPemPath.isNotEmpty() -> {
                 val f = File(caPemPath)
-                log.info(
-                    "GigaChat CA path provided (path=${f.path}, exists=${f.exists()}, size=${if (f.exists()) f.length() else 0})"
-                )
+                log.info("GigaChat CA path provided (path=${f.path}, exists=${f.exists()}, size=${if (f.exists()) f.length() else 0})")
                 if (f.exists()) f else null
             }
 
             else -> {
-                log.info("GigaChat CA not provided (set GIGACHAT_CA_PEM or GIGACHAT_CA_PEM_B64 or GIGACHAT_CA_PEM_PATH). Using system trust store.")
+                log.info("GigaChat CA not provided. Using system trust store.")
                 null
             }
         }
@@ -224,13 +298,13 @@ fun Application.module(llmOverride: LlmClient? = null) {
         if (tm != null) {
             log.info("GigaChat HttpClient(CIO) with custom trustManager created")
             HttpClient(CIO) {
-                install(ClientContentNegotiation) { json(clientJson) }
+                installCommonClientHardening(name = "gigachat")
                 engine { https { trustManager = tm } }
             }
         } else {
             log.info("GigaChat HttpClient(CIO) with system trust store created")
             HttpClient(CIO) {
-                install(ClientContentNegotiation) { json(clientJson) }
+                installCommonClientHardening(name = "gigachat")
             }
         }
     }

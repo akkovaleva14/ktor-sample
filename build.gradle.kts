@@ -38,6 +38,7 @@ dependencies {
     implementation("io.ktor:ktor-client-core-jvm:3.3.2")
     implementation("io.ktor:ktor-client-cio-jvm:3.3.2")
     implementation("io.ktor:ktor-client-content-negotiation-jvm:3.3.2")
+    implementation("io.ktor:ktor-client-timeout-jvm:3.3.2")
 
     testImplementation("io.ktor:ktor-server-test-host-jvm:3.3.2")
     testImplementation(kotlin("test"))
