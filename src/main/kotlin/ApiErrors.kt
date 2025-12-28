@@ -1,0 +1,30 @@
+package com.example
+
+import kotlinx.serialization.Serializable
+
+/**
+ * Централизованный список кодов ошибок — чтобы не плодить "магические строки".
+ */
+object ApiErrorCodes {
+    const val VALIDATION_ERROR = "validation_error"
+    const val BAD_REQUEST = "bad_request"
+    const val NOT_FOUND = "not_found"
+
+    const val SESSION_NOT_FOUND = "session_not_found"
+    const val ASSIGNMENT_NOT_FOUND = "assignment_not_found"
+    const val INVALID_JOIN_KEY = "invalid_join_key"
+
+    const val INTERNAL_ERROR = "internal_error"
+}
+
+@Serializable
+data class ApiError(
+    val code: String,
+    val message: String,
+    val details: Map<String, String> = emptyMap()
+)
+
+@Serializable
+data class ApiErrorEnvelope(
+    val error: ApiError
+)
