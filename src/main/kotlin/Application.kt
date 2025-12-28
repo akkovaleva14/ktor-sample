@@ -17,7 +17,9 @@ import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.Base64
 import java.util.UUID
+import kotlin.io.path.createTempFile
 
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
@@ -163,20 +165,58 @@ fun Application.module(llmOverride: LlmClient? = null) {
             return@run null
         }
 
-        val pemPathEnv = System.getenv("GIGACHAT_CA_PEM") // <-- важно: без дефолта
-        val pemFile = pemPathEnv?.let { File(it) }
+        // Новый контракт переменных:
+        // - GIGACHAT_CA_PEM: PEM-текст (multi-line)  <-- для Render
+        // - GIGACHAT_CA_PEM_B64: PEM-текст в base64 (одна строка) (опционально)
+        // - GIGACHAT_CA_PEM_PATH: путь к файлу (опционально)
+        val caPemEnv = System.getenv("GIGACHAT_CA_PEM")?.trim().orEmpty()
+        val caPemB64 = System.getenv("GIGACHAT_CA_PEM_B64")?.trim().orEmpty()
+        val caPemPath = System.getenv("GIGACHAT_CA_PEM_PATH")?.trim().orEmpty()
 
-        if (pemFile != null) {
-            log.info("GigaChat TLS PEM path: ${pemFile.path} (exists=${pemFile.exists()})")
-        } else {
-            log.info("GigaChat TLS PEM path is not set (GIGACHAT_CA_PEM is empty). Using system trust store.")
+        val pemText: String = when {
+            caPemB64.isNotEmpty() -> {
+                val decoded = try {
+                    String(Base64.getDecoder().decode(caPemB64))
+                } catch (e: Throwable) {
+                    log.error("GIGACHAT_CA_PEM_B64 is set but cannot be base64-decoded", e)
+                    ""
+                }
+                decoded.trim()
+            }
+            caPemEnv.isNotEmpty() -> caPemEnv
+            else -> ""
+        }
+
+        // Готовим файл, который реально существует (если есть PEM-текст или задан путь)
+        val pemFile: File? = when {
+            pemText.contains("BEGIN CERTIFICATE") -> {
+                val tmp = createTempFile(prefix = "gigachat-ca-", suffix = ".pem").toFile()
+                tmp.writeText(pemText + if (pemText.endsWith("\n")) "" else "\n")
+                log.info(
+                    "GigaChat CA loaded from ENV (tempFile=${tmp.absolutePath}, exists=${tmp.exists()}, size=${tmp.length()})"
+                )
+                tmp
+            }
+
+            caPemPath.isNotEmpty() -> {
+                val f = File(caPemPath)
+                log.info(
+                    "GigaChat CA path provided (path=${f.path}, exists=${f.exists()}, size=${if (f.exists()) f.length() else 0})"
+                )
+                if (f.exists()) f else null
+            }
+
+            else -> {
+                log.info("GigaChat CA not provided (set GIGACHAT_CA_PEM or GIGACHAT_CA_PEM_B64 or GIGACHAT_CA_PEM_PATH). Using system trust store.")
+                null
+            }
         }
 
         val tm = if (pemFile != null && pemFile.exists()) {
             try {
                 TlsPemTrust.trustManagerFromPemFile(pemFile.path)
             } catch (e: Throwable) {
-                log.error("Failed to load PEM trust manager from: ${pemFile.path}. Falling back to system trust store.", e)
+                log.error("Failed to load PEM trust manager from file: ${pemFile.path}. Falling back to system trust store.", e)
                 null
             }
         } else null
