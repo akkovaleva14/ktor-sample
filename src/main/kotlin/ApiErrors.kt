@@ -4,6 +4,9 @@ import kotlinx.serialization.Serializable
 
 /**
  * Централизованный список кодов ошибок — чтобы не плодить "магические строки".
+ *
+ * Все ошибки API возвращаются в едином формате:
+ * { "error": { "code": "...", "message": "...", "details": { ... } } }
  */
 object ApiErrorCodes {
     const val VALIDATION_ERROR = "validation_error"

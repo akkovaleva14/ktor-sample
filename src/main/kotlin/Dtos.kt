@@ -8,7 +8,7 @@ import kotlinx.serialization.Serializable
 data class CreateAssignmentReq(
     val topic: String,
     val vocab: List<String> = emptyList(),
-    val level: String? = null // опционально: "A2", "B1" и т.д.
+    val level: String? = null // "A2", "B1" и т.д.
 )
 
 @Serializable
@@ -53,7 +53,15 @@ data class StudentMessageReq(
 data class TutorMessageResp(
     val tutorText: String,
     val hint: String? = null,
+
+    /**
+     * Лексика, которую ученик уже использовал хотя бы раз в рамках этой сессии.
+     */
     val vocabUsed: List<String> = emptyList(),
+
+    /**
+     * Лексика, которую ученик ещё ни разу не использовал в рамках этой сессии.
+     */
     val vocabMissing: List<String> = emptyList()
 )
 

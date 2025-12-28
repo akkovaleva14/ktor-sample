@@ -19,6 +19,11 @@ data class GigaChatTokenResp(
     @SerialName("expires_in") val expiresInSec: Long? = null
 )
 
+/**
+ * Получение и кеширование OAuth-токена GigaChat.
+ *
+ * Токен хранится в памяти и обновляется заранее (с запасом ~30 секунд).
+ */
 class GigaChatAuth(
     private val http: HttpClient,
     private val basicAuthHeaderValue: String, // "Basic xxx"
@@ -42,9 +47,7 @@ class GigaChatAuth(
             accept(ContentType.Application.Json)
             setBody(
                 FormDataContent(
-                    Parameters.build {
-                        append("scope", scope)
-                    }
+                    Parameters.build { append("scope", scope) }
                 )
             )
         }

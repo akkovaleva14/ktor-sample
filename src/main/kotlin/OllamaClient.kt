@@ -9,6 +9,12 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
+/**
+ * LLM-клиент для Ollama (локальный режим).
+ *
+ * Контекст "missing" передаётся по сессии, чтобы не просить повторно то,
+ * что уже было использовано ранее.
+ */
 class OllamaClient(
     private val http: HttpClient,
     private val baseUrl: String = "http://localhost:11434",
@@ -44,7 +50,6 @@ class OllamaClient(
         }
 
         return ollamaGenerateText(prompt).ifBlank {
-            // безопасный фоллбек, если LLM по какой-то причине не вернул текст
             "Let’s start with something simple—what comes to mind first?"
         }
     }
@@ -65,7 +70,7 @@ class OllamaClient(
             appendLine()
             appendLine("Topic: ${session.topic}")
             appendLine("Target vocabulary: ${session.vocab.joinToString(", ")}")
-            appendLine("Missing (not used in the latest student message): ${missing.joinToString(", ")}")
+            appendLine("Missing (not used yet in this session): ${missing.joinToString(", ")}")
             appendLine()
             appendLine("Dialogue rules:")
             appendLine("- Reply as TUTOR only.")
@@ -100,8 +105,7 @@ class OllamaClient(
 
         val raw = resp.bodyAsText()
 
-        // Ollama often returns NDJSON: each line is a JSON object with optional "response" chunk.
-        // We accumulate all "response" fields across lines. Final line often has response="".
+        // Ollama часто возвращает NDJSON: по строкам, каждая строка — JSON с кусочком "response".
         val out = StringBuilder()
 
         val lines = raw.lineSequence()

@@ -12,13 +12,18 @@ data class Assignment(
     val level: String? = null
 )
 
+/**
+ * In-memory хранилище заданий.
+ *
+ * Важно: данные не переживают рестарт сервиса.
+ */
 object AssignmentStore {
     private val byId = ConcurrentHashMap<String, Assignment>()
     private val byJoinKey = ConcurrentHashMap<String, Assignment>()
 
     private val rng = SecureRandom()
 
-    // Human-readable Base32 without ambiguous chars (no I, L, O, U)
+    // Читаемый Base32 без неоднозначных символов (нет I, L, O, U)
     private val alphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
 
     fun create(topic: String, vocab: List<String>, level: String? = null): Assignment {

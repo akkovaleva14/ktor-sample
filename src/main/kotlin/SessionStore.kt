@@ -2,6 +2,8 @@ package com.example
 
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 data class Msg(val role: String, val content: String)
 
@@ -13,8 +15,22 @@ data class Session(
     val vocab: List<String>,
     val level: String? = null,
     val messages: MutableList<Msg> = mutableListOf()
-)
+) {
+    /**
+     * Лок на уровне одной сессии: защищает историю сообщений от гонок,
+     * когда клиент ретраит или шлёт параллельные запросы.
+     */
+    private val lock = ReentrantLock()
 
+    /** Синхронизирует доступ к истории сообщений одной сессии. */
+    fun <T> withLock(block: () -> T): T = lock.withLock(block)
+}
+
+/**
+ * In-memory хранилище сессий.
+ *
+ * Важно: не переживает рестарт и не масштабируется на несколько инстансов без внешнего storage.
+ */
 object SessionStore {
     private val sessions = ConcurrentHashMap<String, Session>()
 

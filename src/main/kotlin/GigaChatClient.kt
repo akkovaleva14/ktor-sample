@@ -7,6 +7,12 @@ import io.ktor.http.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
+/**
+ * LLM-клиент для GigaChat: генерирует стартовую реплику и ответы тьютора.
+ *
+ * Важно: в подсказки/контекст мы передаём "missing" по сессии (а не по последнему сообщению),
+ * чтобы модель не предлагала уже использованные слова заново.
+ */
 class GigaChatClient(
     private val http: HttpClient,
     private val auth: GigaChatAuth,
@@ -52,10 +58,7 @@ class GigaChatClient(
         }.trim()
 
         return chat(
-            listOf(
-                ChatMessage("system", system),
-                ChatMessage("user", user)
-            ),
+            listOf(ChatMessage("system", system), ChatMessage("user", user)),
             temperature = 0.4
         ).ifBlank {
             "Let’s start with something simple—what comes to mind first?"
@@ -84,7 +87,7 @@ class GigaChatClient(
         val user = buildString {
             appendLine("Topic: ${session.topic}")
             appendLine("Target vocabulary: ${session.vocab.joinToString(", ")}")
-            appendLine("Missing in latest student message: ${missing.joinToString(", ")}")
+            appendLine("Missing (not used yet in this session): ${missing.joinToString(", ")}")
             appendLine()
             appendLine("Recent dialogue:")
             appendLine(history)

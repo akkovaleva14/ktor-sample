@@ -2,13 +2,16 @@ package com.example
 
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.*
+import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.client.plugins.HttpRequestTimeoutException
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
-import io.ktor.server.plugins.*
+import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.ContentTransformationException
 import io.ktor.server.plugins.callid.*
 import io.ktor.server.plugins.calllogging.*
 import io.ktor.server.plugins.contentnegotiation.*
@@ -33,8 +36,10 @@ fun main() {
 }
 
 /**
- * В проде можно вызывать module() без параметров — поднимется выбранный LLM провайдер.
- * В тестах передаём fake LlmClient, чтобы тесты были детерминированными.
+ * Главный модуль Ktor.
+ *
+ * В проде можно вызывать module() без параметров — LLM-провайдер выбирается по env.
+ * В тестах можно передать llmOverride (fake), чтобы тесты были детерминированными.
  */
 fun Application.module(llmOverride: LlmClient? = null) {
     val log = this.log
@@ -104,7 +109,7 @@ fun Application.module(llmOverride: LlmClient? = null) {
             )
         }
 
-        // ⏱ Timeouts (Ktor client)
+        // ⏱ Таймауты на исходящих HTTP-запросах (к LLM/OAuth)
         exception<HttpRequestTimeoutException> { call, cause ->
             log.warn("Upstream timeout. requestId=${call.callId}. ${cause.message}")
             call.respond(
@@ -118,14 +123,20 @@ fun Application.module(llmOverride: LlmClient? = null) {
             )
         }
 
-        // 🌐 Typed upstream errors
+        // 🌐 Типизированные ошибки внешних API
         exception<UpstreamException> { call, cause ->
             val (status, code) = when {
-                cause.status == HttpStatusCode.TooManyRequests -> HttpStatusCode.TooManyRequests to ApiErrorCodes.RATE_LIMIT
+                cause.status == HttpStatusCode.TooManyRequests ->
+                    HttpStatusCode.TooManyRequests to ApiErrorCodes.RATE_LIMIT
+
                 cause.status == HttpStatusCode.Unauthorized || cause.status == HttpStatusCode.Forbidden ->
                     HttpStatusCode.BadGateway to ApiErrorCodes.AUTH_ERROR
-                cause.status.value in 500..599 -> HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
-                else -> HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
+
+                cause.status.value in 500..599 ->
+                    HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
+
+                else ->
+                    HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
             }
 
             // Безопасно: не логируем секреты, только статус/сниппет
@@ -196,17 +207,21 @@ fun Application.module(llmOverride: LlmClient? = null) {
 
     val clientJson = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Общие настройки исходящих HTTP-клиентов:
+     * - JSON
+     * - таймауты
+     * - ретраи только для временных сбоев (5xx/429/таймауты)
+     */
     fun HttpClientConfig<CIOEngineConfig>.installCommonClientHardening(name: String) {
         install(ClientContentNegotiation) { json(clientJson) }
 
-        // ⏱ Timeouts: conservative defaults for LLM calls
         install(HttpTimeout) {
             connectTimeoutMillis = 5.seconds.inWholeMilliseconds
             socketTimeoutMillis = 20.seconds.inWholeMilliseconds
             requestTimeoutMillis = 25.seconds.inWholeMilliseconds
         }
 
-        // 🔁 Retries: only for transient issues
         install(HttpRequestRetry) {
             maxRetries = 2
             retryIf { _, response ->
@@ -221,23 +236,17 @@ fun Application.module(llmOverride: LlmClient? = null) {
                         cause is java.net.SocketTimeoutException ||
                         cause is java.io.IOException
             }
-            // small exponential-ish backoff (keep it simple and bounded)
             delayMillis { retry -> (200L * (retry + 1)).coerceAtMost(800L) }
             modifyRequest { request ->
-                // helps with tracing retry waves (no secrets)
                 request.headers.append("X-Retry-Attempt", retryCount.toString())
                 request.headers.append("X-Client-Name", name)
             }
         }
 
-        // Avoid throwing exceptions for non-2xx automatically
         expectSuccess = false
     }
 
-    // Default client (Ollama / local)
-    val llmHttp = HttpClient(CIO) {
-        installCommonClientHardening(name = "llm-default")
-    }
+    val llmHttp = HttpClient(CIO) { installCommonClientHardening(name = "llm-default") }
 
     val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
     log.info("LLM_PROVIDER=$provider")
@@ -303,9 +312,7 @@ fun Application.module(llmOverride: LlmClient? = null) {
             }
         } else {
             log.info("GigaChat HttpClient(CIO) with system trust store created")
-            HttpClient(CIO) {
-                installCommonClientHardening(name = "gigachat")
-            }
+            HttpClient(CIO) { installCommonClientHardening(name = "gigachat") }
         }
     }
 
