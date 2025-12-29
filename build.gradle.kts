@@ -43,4 +43,17 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-client-content-negotiation-jvm:3.3.2")
     testImplementation("io.ktor:ktor-serialization-kotlinx-json-jvm:3.3.2")
+
+    // Postgres JDBC driver
+    implementation("org.postgresql:postgresql:42.7.4")
+
+    // HikariCP (connection pool)
+    implementation("com.zaxxer:HikariCP:5.1.0")
+
+    // Flyway migrations
+    implementation("org.flywaydb:flyway-core:10.17.0")
+
+    // (опционально, но удобно) для работы Flyway с postgres URL
+    // обычно не требуется отдельно, но если будет ругаться — добавим:
+     implementation("org.flywaydb:flyway-database-postgresql:10.17.0")
 }

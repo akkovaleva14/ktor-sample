@@ -47,6 +47,27 @@ fun Application.module(llmOverride: LlmClient? = null) {
     // Для /health и простого uptime
     attributes.put(AppAttributes.StartedAtMs, System.currentTimeMillis())
 
+    /**
+     * Инициализация Postgres (Render) и миграций Flyway.
+     *
+     * Важно:
+     * - DATABASE_URL должен быть задан в env у Render Web Service
+     * - миграции должны лежать в src/main/resources/db/migration (например V1__init.sql)
+     */
+    val dataSource = runCatching {
+        Database.createDataSourceFromEnv()
+    }.onFailure { e ->
+        log.error("Failed to create DataSource from DATABASE_URL", e)
+    }.getOrThrow()
+
+    runCatching {
+        Database.migrate(dataSource)
+    }.onFailure { e ->
+        log.error("Flyway migration failed", e)
+    }.getOrThrow()
+
+    log.info("DB connected and migrations applied")
+
     install(CallId) {
         header(HttpHeaders.XRequestId)
         generate { UUID.randomUUID().toString() }
@@ -353,6 +374,9 @@ fun Application.module(llmOverride: LlmClient? = null) {
     monitor.subscribe(ApplicationStopped) {
         llmHttp.close()
         gigaHttp?.close()
+
+        // Закрываем пул БД последним — после остановки обработки запросов.
+        runCatching { dataSource.close() }
     }
 
     configureRouting(llm)
