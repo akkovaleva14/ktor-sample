@@ -78,6 +78,7 @@ object Database {
         val flyway = Flyway.configure()
             .dataSource(ds)
             .locations("classpath:db/migration")
+            .validateMigrationNaming(true)
             .baselineOnMigrate(true)
             .load()
 
