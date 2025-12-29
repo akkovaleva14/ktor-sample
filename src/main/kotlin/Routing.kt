@@ -36,10 +36,10 @@ fun Application.configureRouting(llm: LlmClient) {
             val uptimeSec = ((System.currentTimeMillis() - startedAt) / 1000).coerceAtLeast(0)
 
             call.respond(
-                mapOf(
-                    "status" to "ok",
-                    "provider" to provider,
-                    "uptimeSec" to uptimeSec
+                HealthResp(
+                    status = "ok",
+                    provider = provider,
+                    uptimeSec = uptimeSec
                 )
             )
         }
@@ -49,7 +49,9 @@ fun Application.configureRouting(llm: LlmClient) {
             get("/llm/ping") {
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
                 val t0 = System.nanoTime()
+
                 val text = llm.generateOpener(topic = "Ping", vocab = listOf("hello"), level = null)
+
                 val tookMs = (System.nanoTime() - t0) / 1_000_000
 
                 application.log.info(
@@ -57,10 +59,11 @@ fun Application.configureRouting(llm: LlmClient) {
                 )
 
                 call.respond(
-                    mapOf(
-                        "status" to "ok",
-                        "provider" to provider,
-                        "sample" to text.take(200)
+                    LlmPingResp(
+                        status = "ok",
+                        provider = provider,
+                        sample = text.take(200),
+                        tookMs = tookMs
                     )
                 )
             }

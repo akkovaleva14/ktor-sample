@@ -2,6 +2,23 @@ package com.example
 
 import kotlinx.serialization.Serializable
 
+// ---------- Common / misc ----------
+
+@Serializable
+data class HealthResp(
+    val status: String,
+    val provider: String,
+    val uptimeSec: Long
+)
+
+@Serializable
+data class LlmPingResp(
+    val status: String,
+    val provider: String,
+    val sample: String,
+    val tookMs: Long
+)
+
 // ---------- Teacher side: assignments ----------
 
 @Serializable
