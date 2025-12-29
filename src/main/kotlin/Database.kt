@@ -75,21 +75,47 @@ object Database {
     }
 
     fun migrate(ds: DataSource) {
+        // 1) Flyway version (from the running artifact)
+        val implVersion = Flyway::class.java.`package`?.implementationVersion
+        println("Flyway implementationVersion = $implVersion")
+
+        // 2) Environment overrides (Render dashboard env vars)
+        val flywayEnv = System.getenv()
+            .filterKeys { it.startsWith("FLYWAY_") }
+            .toSortedMap()
+        println("FLYWAY_* env vars = $flywayEnv")
+
+        // 3) JVM system properties overrides (-Dflyway....), often via JAVA_TOOL_OPTIONS
+        val flywayProps = System.getProperties()
+            .entries
+            .asSequence()
+            .map { it.key.toString() to it.value.toString() }
+            .filter { (k, _) -> k.startsWith("flyway.") }
+            .sortedBy { it.first }
+            .toList()
+        println("flyway.* system properties = $flywayProps")
+
         val flyway = Flyway.configure()
             .dataSource(ds)
             .locations("classpath:db/migration")
-
-            // фиксируем стандартные правила (иначе их может переопределить окружение)
             .sqlMigrationPrefix("V")
             .repeatableSqlMigrationPrefix("R")
             .sqlMigrationSeparator("__")
             .sqlMigrationSuffixes(".sql")
-
-            // пусть валится и пишет конкретику, если ещё что-то не так
             .validateMigrationNaming(true)
-
             .baselineOnMigrate(true)
             .load()
+
+        // 4) What Flyway thinks the config is AFTER load()
+        val cfg = flyway.configuration
+        println(
+            "Flyway effective config: " +
+                    "locations=${cfg.locations?.toList()}, " +
+                    "prefix=${cfg.sqlMigrationPrefix}, " +
+                    "repeatablePrefix=${cfg.repeatableSqlMigrationPrefix}, " +
+                    "separator=${cfg.sqlMigrationSeparator}, " +
+                    "suffixes=${cfg.sqlMigrationSuffixes?.toList()}"
+        )
 
         flyway.migrate()
     }
