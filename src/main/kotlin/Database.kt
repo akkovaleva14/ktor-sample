@@ -78,7 +78,16 @@ object Database {
         val flyway = Flyway.configure()
             .dataSource(ds)
             .locations("classpath:db/migration")
+
+            // фиксируем стандартные правила (иначе их может переопределить окружение)
+            .sqlMigrationPrefix("V")
+            .repeatableSqlMigrationPrefix("R")
+            .sqlMigrationSeparator("__")
+            .sqlMigrationSuffixes(".sql")
+
+            // пусть валится и пишет конкретику, если ещё что-то не так
             .validateMigrationNaming(true)
+
             .baselineOnMigrate(true)
             .load()
 
