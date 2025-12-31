@@ -1,4 +1,3 @@
--- assignments: задания, которые создаёт teacher
 create table if not exists assignments (
     id uuid primary key,
     join_key text not null unique,
@@ -10,7 +9,6 @@ create table if not exists assignments (
 
 create index if not exists idx_assignments_join_key on assignments(join_key);
 
--- sessions: конкретная сессия ученика, открытая по join_key
 create table if not exists sessions (
     id uuid primary key,
     assignment_id uuid not null references assignments(id) on delete cascade,
@@ -23,7 +21,6 @@ create table if not exists sessions (
 
 create index if not exists idx_sessions_assignment_id on sessions(assignment_id);
 
--- messages: история диалога по сессии
 create table if not exists messages (
     id bigserial primary key,
     session_id uuid not null references sessions(id) on delete cascade,
@@ -36,7 +33,6 @@ create table if not exists messages (
 
 create index if not exists idx_messages_session_id on messages(session_id);
 
--- idempotency: кэш ответов для POST /messages (чтобы не плодить дублей на ретраях)
 create table if not exists idempotency (
     session_id uuid not null references sessions(id) on delete cascade,
     idem_key text not null,
