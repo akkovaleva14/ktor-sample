@@ -5,6 +5,8 @@ import com.example.db.Db
 import com.example.db.IdempotencyRepo
 import com.example.db.MessagesRepo
 import com.example.db.SessionsRepo
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.HttpRequestRetry
@@ -23,10 +25,15 @@ import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.plugins.requestvalidation.*
 import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
+import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
+import org.flywaydb.core.Flyway
 import java.io.File
+import java.net.URI
+import java.time.Duration
 import java.util.Base64
 import java.util.UUID
+import javax.sql.DataSource
 import kotlin.io.path.createTempFile
 import kotlin.time.Duration.Companion.seconds
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation as ClientContentNegotiation
@@ -65,6 +72,43 @@ fun Application.module(llmOverride: LlmClient? = null) {
     val sessionsRepo = SessionsRepo(db, messagesRepo)
     val assignmentsRepo = AssignmentsRepo(db)
     val idempotencyRepo = IdempotencyRepo(db)
+
+    // --- Background cleanup: idempotency table TTL ---
+    val idemCleanupEnabled = System.getenv("IDEMPOTENCY_CLEANUP_ENABLED")?.trim()?.lowercase()
+        ?.let { it == "1" || it == "true" || it == "yes" } ?: true
+
+    val idemTtlDays = System.getenv("IDEMPOTENCY_TTL_DAYS")?.trim()?.toLongOrNull()?.coerceAtLeast(1) ?: 7L
+    val idemCleanupEveryMin = System.getenv("IDEMPOTENCY_CLEANUP_EVERY_MIN")?.trim()?.toLongOrNull()?.coerceAtLeast(1)
+        ?: 60L
+
+    val cleanupJob: Job? = if (idemCleanupEnabled) {
+        log.info("Idempotency cleanup enabled: ttlDays=$idemTtlDays everyMin=$idemCleanupEveryMin")
+
+        // Ktor app coroutine scope
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            // small initial delay to let app start
+            delay(15_000)
+
+            val ttl = Duration.ofDays(idemTtlDays)
+            val periodMs = Duration.ofMinutes(idemCleanupEveryMin).toMillis()
+
+            while (isActive) {
+                try {
+                    val deleted = idempotencyRepo.cleanupOlderThan(ttl)
+                    if (deleted > 0) {
+                        log.info("Idempotency cleanup: deleted=$deleted olderThanDays=$idemTtlDays")
+                    }
+                } catch (t: Throwable) {
+                    log.warn("Idempotency cleanup failed: ${t.message}", t)
+                }
+
+                delay(periodMs)
+            }
+        }
+    } else {
+        log.info("Idempotency cleanup disabled by env IDEMPOTENCY_CLEANUP_ENABLED")
+        null
+    }
 
     install(CallId) {
         header(HttpHeaders.XRequestId)
@@ -361,6 +405,7 @@ fun Application.module(llmOverride: LlmClient? = null) {
     }
 
     monitor.subscribe(ApplicationStopped) {
+        cleanupJob?.cancel()
         llmHttp.close()
         gigaHttp?.close()
         runCatching { dataSource.close() }

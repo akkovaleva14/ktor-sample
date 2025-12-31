@@ -88,22 +88,16 @@ class MessagesRepo(private val db: Db) {
     /**
      * Must be called inside a transaction.
      * Guarantees unique (session_id, seq) by locking the session row.
+     *
+     * Optimized: uses sessions.next_seq (O(1)) instead of max(seq).
      */
     fun appendInTx(conn: Connection, sessionId: UUID, role: String, content: String): Int {
-        // lock session row
-        conn.prepared(
-            "select 1 from public.sessions where id = ? for update",
-            sessionId
-        ).use { ps ->
-            ps.executeQuery().use { rs ->
-                if (!rs.next()) throw IllegalArgumentException("Session not found")
-            }
-        }
-
+        // Lock session row and read next_seq
         val nextSeq = conn.prepared(
-            "select coalesce(max(seq), 0) + 1 from public.messages where session_id = ?",
+            "select next_seq from public.sessions where id = ? for update",
             sessionId
-        ).queryOneOrNull { rs -> rs.getInt(1) } ?: 1
+        ).queryOneOrNull { rs -> rs.getInt(1) }
+            ?: throw IllegalArgumentException("Session not found")
 
         conn.prepared(
             """
@@ -111,6 +105,12 @@ class MessagesRepo(private val db: Db) {
             values (?, ?, ?, ?)
             """.trimIndent(),
             sessionId, nextSeq, role, content
+        ).execUpdate()
+
+        // Increment next_seq
+        conn.prepared(
+            "update public.sessions set next_seq = next_seq + 1 where id = ?",
+            sessionId
         ).execUpdate()
 
         return nextSeq

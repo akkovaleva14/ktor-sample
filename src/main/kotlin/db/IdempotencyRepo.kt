@@ -29,10 +29,6 @@ class IdempotencyRepo(private val db: Db) {
         getInConn(conn, sessionId, key)
     }
 
-    /**
-     * Claim idempotency key. Returns true if this caller successfully claimed it.
-     * (Implemented as "insert pending on conflict do nothing")
-     */
     fun claim(sessionId: UUID, key: String): Boolean = db.query { conn ->
         claimInConn(conn, sessionId, key)
     }
@@ -40,6 +36,20 @@ class IdempotencyRepo(private val db: Db) {
     fun complete(sessionId: UUID, key: String, resp: TutorMessageResp) {
         db.query { conn ->
             completeInConn(conn, sessionId, key, resp)
+        }
+    }
+
+    /**
+     * Deletes idempotency rows older than [ttl].
+     * Returns number of deleted rows.
+     */
+    fun cleanupOlderThan(ttl: Duration): Int {
+        require(!ttl.isNegative && !ttl.isZero) { "ttl must be > 0" }
+        return db.query { conn ->
+            conn.prepared(
+                "delete from public.idempotency where created_at < (now() - (?::interval))",
+                durationToPgInterval(ttl)
+            ).execUpdate()
         }
     }
 
@@ -75,11 +85,8 @@ class IdempotencyRepo(private val db: Db) {
         } ?: return null
 
         if (isPendingJson(row.responseText)) {
-            // If pending is too old, treat it as absent to allow a safe retry.
             val age = Duration.between(row.createdAt, Instant.now())
             if (age > pendingTtl) return null
-
-            // Still pending and fresh -> caller should retry later.
             return null
         }
 
@@ -117,5 +124,21 @@ class IdempotencyRepo(private val db: Db) {
         val status = runCatching { statusEl.jsonPrimitive.content }.getOrNull() ?: return false
 
         return status == "pending"
+    }
+
+    private fun durationToPgInterval(d: Duration): String {
+        val totalSeconds = d.seconds
+        val days = totalSeconds / 86_400
+        val hours = (totalSeconds % 86_400) / 3_600
+        val minutes = (totalSeconds % 3_600) / 60
+        val seconds = totalSeconds % 60
+
+        // Safe textual interval: "X days Y hours Z minutes S seconds"
+        return buildString {
+            if (days != 0L) append("$days days ")
+            if (hours != 0L) append("$hours hours ")
+            if (minutes != 0L) append("$minutes minutes ")
+            if (seconds != 0L || isEmpty()) append("$seconds seconds")
+        }.trim()
     }
 }
