@@ -6,13 +6,24 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.sql.Connection
+import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 
 class IdempotencyRepo(private val db: Db) {
     private val json = Json { ignoreUnknownKeys = true }
 
-    // Keep it minimal and stable. We'll detect pending by parsing JSON, not by string equality.
+    /**
+     * Stored as response JSON.
+     * We'll detect pending by parsing JSON, not by string equality.
+     */
     private val pendingJson = """{"status":"pending"}"""
+
+    /**
+     * If a request claimed an idempotency key but never completed (crash/timeout),
+     * we should allow retries after some time.
+     */
+    private val pendingTtl: Duration = Duration.ofMinutes(2)
 
     fun get(sessionId: UUID, key: String): TutorMessageResp? = db.query { conn ->
         getInConn(conn, sessionId, key)
@@ -46,16 +57,34 @@ class IdempotencyRepo(private val db: Db) {
 
     // ---- internals
 
-    private fun getInConn(conn: Connection, sessionId: UUID, key: String): TutorMessageResp? {
-        val raw = conn.prepared(
-            "select response::text from public.idempotency where session_id = ? and idem_key = ?",
-            sessionId, key
-        ).queryOneOrNull { rs -> rs.getString(1) } ?: return null
+    private data class RawRow(val responseText: String, val createdAt: Instant)
 
-        if (isPendingJson(raw)) return null
+    private fun getInConn(conn: Connection, sessionId: UUID, key: String): TutorMessageResp? {
+        val row = conn.prepared(
+            """
+            select response::text as response_text, created_at
+            from public.idempotency
+            where session_id = ? and idem_key = ?
+            """.trimIndent(),
+            sessionId, key
+        ).queryOneOrNull { rs ->
+            RawRow(
+                responseText = rs.getString("response_text"),
+                createdAt = rs.getTimestamp("created_at").toInstant()
+            )
+        } ?: return null
+
+        if (isPendingJson(row.responseText)) {
+            // If pending is too old, treat it as absent to allow a safe retry.
+            val age = Duration.between(row.createdAt, Instant.now())
+            if (age > pendingTtl) return null
+
+            // Still pending and fresh -> caller should retry later.
+            return null
+        }
 
         return runCatching {
-            json.decodeFromString(TutorMessageResp.serializer(), raw)
+            json.decodeFromString(TutorMessageResp.serializer(), row.responseText)
         }.getOrNull()
     }
 

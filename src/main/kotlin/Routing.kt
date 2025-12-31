@@ -32,6 +32,9 @@ fun Application.configureRouting(
 ) {
     val json = Json { ignoreUnknownKeys = true }
 
+    // How many last messages we give to the LLM as conversation context.
+    val llmContextLimit = 60
+
     routing {
         head("/") { call.respond(HttpStatusCode.OK) }
         get("/") { call.respondText("OK") }
@@ -275,7 +278,7 @@ fun Application.configureRouting(
                 }
 
                 // Ensure session exists (cheap)
-                val sessionSnapshotBefore = sessions.getSessionSnapshot(sessionId)
+                val sessionSnapshotBefore = sessions.getSessionSnapshot(sessionId, messageLimit = llmContextLimit)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -321,7 +324,7 @@ fun Application.configureRouting(
                             return@post
                         }
 
-                        // Still pending.
+                        // Still pending (or fresh pending). Let client retry.
                         call.respond(
                             HttpStatusCode.Conflict,
                             ApiErrorEnvelope(
@@ -340,8 +343,8 @@ fun Application.configureRouting(
                     }
                 }
 
-                // IMPORTANT: snapshot for LLM should include the just-inserted student message
-                val sessionSnapshot = sessions.getSessionSnapshot(sessionId)
+                // Snapshot for LLM should include the just-inserted student message
+                val sessionSnapshot = sessions.getSessionSnapshot(sessionId, messageLimit = llmContextLimit)
                     ?: sessionSnapshotBefore
 
                 // 3) Compute coverage from persisted history (student corpus)
@@ -391,7 +394,8 @@ fun Application.configureRouting(
                     ?: throw IllegalArgumentException("Missing session id")
                 val sessionId = UUID.fromString(sessionIdStr)
 
-                val session = sessions.getSessionSnapshot(sessionId)
+                // Full history for UI
+                val session = sessions.getSessionSnapshot(sessionId, messageLimit = null)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,

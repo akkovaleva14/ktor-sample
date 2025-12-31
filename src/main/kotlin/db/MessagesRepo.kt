@@ -32,6 +32,36 @@ class MessagesRepo(private val db: Db) {
         }
     }
 
+    /**
+     * Returns last [limit] messages in correct chronological order (seq asc).
+     * Useful for LLM context without loading full history.
+     */
+    fun listBySessionLast(sessionId: UUID, limit: Int): List<DbMessage> {
+        require(limit > 0) { "limit must be > 0" }
+
+        return db.query { conn ->
+            val desc = conn.prepared(
+                """
+                select seq, role, content, created_at
+                from public.messages
+                where session_id = ?
+                order by seq desc
+                limit ?
+                """.trimIndent(),
+                sessionId, limit
+            ).queryList { rs ->
+                DbMessage(
+                    seq = rs.getInt("seq"),
+                    role = rs.getString("role"),
+                    content = rs.getString("content"),
+                    createdAt = rs.getTimestamp("created_at").toInstant()
+                )
+            }
+
+            desc.asReversed()
+        }
+    }
+
     fun listStudentContents(sessionId: UUID): List<String> = db.query { conn ->
         conn.prepared(
             """

@@ -27,7 +27,11 @@ class SessionsRepo(private val db: Db, private val messages: MessagesRepo) {
         return sessionId
     }
 
-    fun getSessionSnapshot(sessionId: UUID): Session? = db.query { conn ->
+    /**
+     * If [messageLimit] is provided, returns a snapshot with only the last N messages.
+     * If null, returns full history.
+     */
+    fun getSessionSnapshot(sessionId: UUID, messageLimit: Int? = null): Session? = db.query { conn ->
         val row = conn.prepared(
             """
             select id, assignment_id, join_key, topic, vocab::text as vocab_text, level
@@ -52,7 +56,12 @@ class SessionsRepo(private val db: Db, private val messages: MessagesRepo) {
         val vocabJson = row[4] as String
         val level = row[5] as String?
 
-        val msgs = messages.listBySession(id)
+        val dbMsgs = when (val lim = messageLimit) {
+            null -> messages.listBySession(id)
+            else -> messages.listBySessionLast(id, lim)
+        }
+
+        val msgs = dbMsgs
             .map { Msg(it.role, it.content) }
             .toMutableList()
 
