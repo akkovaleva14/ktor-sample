@@ -102,7 +102,7 @@ object Database {
             .repeatableSqlMigrationPrefix("R")
             .sqlMigrationSeparator("__")
             .sqlMigrationSuffixes(".sql")
-            .validateMigrationNaming(true)
+            .validateMigrationNaming(false)
             .baselineOnMigrate(true)
             .load()
 
