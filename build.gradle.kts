@@ -51,9 +51,6 @@ dependencies {
     implementation("com.zaxxer:HikariCP:5.1.0")
 
     // Flyway migrations
-    implementation("org.flywaydb:flyway-core:10.17.0")
-
-    // (опционально, но удобно) для работы Flyway с postgres URL
-    // обычно не требуется отдельно, но если будет ругаться — добавим:
-     implementation("org.flywaydb:flyway-database-postgresql:10.17.0")
+    implementation("org.flywaydb:flyway-core:9.22.3")
+    implementation("org.flywaydb:flyway-database-postgresql:9.22.3")
 }
