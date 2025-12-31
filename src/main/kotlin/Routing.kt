@@ -275,7 +275,7 @@ fun Application.configureRouting(
                 }
 
                 // Ensure session exists (cheap)
-                val sessionSnapshot = sessions.getSessionSnapshot(sessionId)
+                val sessionSnapshotBefore = sessions.getSessionSnapshot(sessionId)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -303,18 +303,25 @@ fun Application.configureRouting(
                 val req = call.receive<StudentMessageReq>()
                 val studentText = req.text.trim()
 
-                // 2) If idempotency is provided: claim the key to avoid double LLM calls
+                // 2) Claim (and only then persist student message) inside ONE tx
                 if (idemKey != null) {
-                    val claimed = idem.claim(sessionId, idemKey)
+                    val claimed = db.tx { conn ->
+                        val ok = idem.claimInTx(conn, sessionId, idemKey)
+                        if (!ok) return@tx false
+
+                        messages.appendInTx(conn, sessionId, role = "student", content = studentText)
+                        true
+                    }
+
                     if (!claimed) {
-                        // someone else has it; try read again (maybe already completed)
+                        // Someone else already claimed it; return cached if already completed.
                         val cached = idem.get(sessionId, idemKey)
                         if (cached != null) {
                             call.respond(cached)
                             return@post
                         }
 
-                        // simplest safe behavior: tell client to retry later
+                        // Still pending.
                         call.respond(
                             HttpStatusCode.Conflict,
                             ApiErrorEnvelope(
@@ -326,24 +333,28 @@ fun Application.configureRouting(
                         )
                         return@post
                     }
+                } else {
+                    // No idempotency: just persist student message
+                    db.tx { conn ->
+                        messages.appendInTx(conn, sessionId, role = "student", content = studentText)
+                    }
                 }
 
-                // 3) Persist student message (tx ensures seq consistency)
-                db.tx { conn ->
-                    messages.appendInTx(conn, sessionId, role = "student", content = studentText)
-                }
+                // IMPORTANT: snapshot for LLM should include the just-inserted student message
+                val sessionSnapshot = sessions.getSessionSnapshot(sessionId)
+                    ?: sessionSnapshotBefore
 
-                // 4) Compute coverage from persisted history (student corpus)
+                // 3) Compute coverage from persisted history (student corpus)
                 val studentCorpus = messages.listStudentContents(sessionId).joinToString("\n")
                 val (usedEver, missingEver) = computeVocabCoverage(studentCorpus, sessionSnapshot.vocab)
                 val studentTurns = messages.countByRole(sessionId, role = "student")
 
-                // 5) Call LLM outside tx
+                // 4) Call LLM outside tx
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
                 val t0 = System.nanoTime()
 
                 val tutorTextFromLlm = llm.tutorReply(
-                    session = sessionSnapshot, // snapshot (topic/vocab/messages)
+                    session = sessionSnapshot,
                     studentText = studentText,
                     used = usedEver,
                     missing = missingEver
@@ -364,14 +375,12 @@ fun Application.configureRouting(
                     vocabMissing = missingEver
                 )
 
-                // 6) Persist tutor message
+                // 5) Persist tutor message + complete idempotency (if used) in one tx
                 db.tx { conn ->
                     messages.appendInTx(conn, sessionId, role = "tutor", content = tutor.tutorText)
-                }
-
-                // 7) Complete idempotency (if used)
-                if (idemKey != null) {
-                    idem.complete(sessionId, idemKey, tutor)
+                    if (idemKey != null) {
+                        idem.completeInTx(conn, sessionId, idemKey, tutor)
+                    }
                 }
 
                 call.respond(tutor)
