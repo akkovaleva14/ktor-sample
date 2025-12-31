@@ -83,7 +83,10 @@ class IdempotencyRepo(private val db: Db) {
     private fun isPendingJson(raw: String): Boolean {
         val el: JsonElement = runCatching { json.parseToJsonElement(raw) }.getOrNull() ?: return false
         val obj = el as? JsonObject ?: return false
-        val status = obj["status"]?.jsonPrimitive?.contentOrNull ?: return false
+
+        val statusEl = obj["status"] ?: return false
+        val status = runCatching { statusEl.jsonPrimitive.content }.getOrNull() ?: return false
+
         return status == "pending"
     }
 }
