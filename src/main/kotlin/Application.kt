@@ -1,5 +1,10 @@
 package com.example
 
+import com.example.db.AssignmentsRepo
+import com.example.db.Db
+import com.example.db.IdempotencyRepo
+import com.example.db.MessagesRepo
+import com.example.db.SessionsRepo
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.HttpRequestRetry
@@ -35,25 +40,11 @@ fun main() {
     }.start(wait = true)
 }
 
-/**
- * Главный модуль Ktor.
- *
- * В проде можно вызывать module() без параметров — LLM-провайдер выбирается по env.
- * В тестах можно передать llmOverride (fake), чтобы тесты были детерминированными.
- */
 fun Application.module(llmOverride: LlmClient? = null) {
     val log = this.log
 
-    // Для /health и простого uptime
     attributes.put(AppAttributes.StartedAtMs, System.currentTimeMillis())
 
-    /**
-     * Инициализация Postgres (Render) и миграций Flyway.
-     *
-     * Важно:
-     * - DATABASE_URL должен быть задан в env у Render Web Service
-     * - миграции должны лежать в src/main/resources/db/migration (например V1__init.sql)
-     */
     val dataSource = runCatching {
         Database.createDataSourceFromEnv()
     }.onFailure { e ->
@@ -67,6 +58,13 @@ fun Application.module(llmOverride: LlmClient? = null) {
     }.getOrThrow()
 
     log.info("DB connected and migrations applied")
+
+    // ✅ JDBC repos
+    val db = Db(dataSource)
+    val messagesRepo = MessagesRepo(db)
+    val sessionsRepo = SessionsRepo(db, messagesRepo)
+    val assignmentsRepo = AssignmentsRepo(db)
+    val idempotencyRepo = IdempotencyRepo(db)
 
     install(CallId) {
         header(HttpHeaders.XRequestId)
@@ -133,7 +131,6 @@ fun Application.module(llmOverride: LlmClient? = null) {
             )
         }
 
-        // ⏱ Таймауты на исходящих HTTP-запросах (к LLM/OAuth)
         exception<HttpRequestTimeoutException> { call, cause ->
             log.warn("Upstream timeout. requestId=${call.callId}. ${cause.message}")
             call.respond(
@@ -147,7 +144,6 @@ fun Application.module(llmOverride: LlmClient? = null) {
             )
         }
 
-        // 🌐 Типизированные ошибки внешних API
         exception<UpstreamException> { call, cause ->
             val (status, code) = when {
                 cause.status == HttpStatusCode.TooManyRequests ->
@@ -163,7 +159,6 @@ fun Application.module(llmOverride: LlmClient? = null) {
                     HttpStatusCode.BadGateway to ApiErrorCodes.UPSTREAM_ERROR
             }
 
-            // Безопасно: не логируем секреты, только статус/сниппет
             log.warn(
                 "UpstreamException. requestId=${call.callId} upstream=${cause.upstream} status=${cause.status.value} bodySnippet=${cause.bodySnippet.orEmpty()}"
             )
@@ -231,12 +226,6 @@ fun Application.module(llmOverride: LlmClient? = null) {
 
     val clientJson = Json { ignoreUnknownKeys = true }
 
-    /**
-     * Общие настройки исходящих HTTP-клиентов:
-     * - JSON
-     * - таймауты
-     * - ретраи только для временных сбоев (5xx/429/таймауты)
-     */
     fun HttpClientConfig<CIOEngineConfig>.installCommonClientHardening(name: String) {
         install(ClientContentNegotiation) { json(clientJson) }
 
@@ -374,10 +363,16 @@ fun Application.module(llmOverride: LlmClient? = null) {
     monitor.subscribe(ApplicationStopped) {
         llmHttp.close()
         gigaHttp?.close()
-
-        // Закрываем пул БД последним — после остановки обработки запросов.
         runCatching { dataSource.close() }
     }
 
-    configureRouting(llm)
+    // ✅ Updated routing uses DB repos
+    configureRouting(
+        llm = llm,
+        assignments = assignmentsRepo,
+        sessions = sessionsRepo,
+        messages = messagesRepo,
+        idem = idempotencyRepo,
+        db = db
+    )
 }

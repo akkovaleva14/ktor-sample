@@ -1,24 +1,37 @@
 package com.example
 
-import io.ktor.http.*
-import io.ktor.server.application.*
-import io.ktor.server.plugins.callid.*
-import io.ktor.server.request.*
-import io.ktor.server.response.*
-import io.ktor.server.routing.*
+import com.example.db.AssignmentsRepo
+import com.example.db.Db
+import com.example.db.IdempotencyRepo
+import com.example.db.MessagesRepo
+import com.example.db.SessionsRepo
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.Application
+import io.ktor.server.application.log
+import io.ktor.server.plugins.callid.callId
+import io.ktor.server.request.receive
+import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
+import io.ktor.server.routing.application
+import io.ktor.server.routing.delete
+import io.ktor.server.routing.get
+import io.ktor.server.routing.head
+import io.ktor.server.routing.post
+import io.ktor.server.routing.route
+import io.ktor.server.routing.routing
+import kotlinx.serialization.json.Json
+import java.util.UUID
 
-/**
- * Роутинг API.
- *
- * Особенности надёжности:
- * 1) vocabUsed/vocabMissing считаются по всей сессии (по всем student-сообщениям).
- * 2) POST /messages поддерживает идемпотентность по заголовку Idempotency-Key:
- *    повторный запрос с тем же ключом вернёт тот же ответ без дублей в истории.
- * 3) Rate limit: in-memory ограничения по IP/сессии, чтобы не "сжигать" LLM.
- * 4) Teacher auth: создание заданий закрыто Bearer-токеном.
- * 5) Наблюдаемость: логируем latency LLM-вызовов + uptime в /health.
- */
-fun Application.configureRouting(llm: LlmClient) {
+fun Application.configureRouting(
+    llm: LlmClient,
+    assignments: AssignmentsRepo,
+    sessions: SessionsRepo,
+    messages: MessagesRepo,
+    idem: IdempotencyRepo,
+    db: Db
+) {
+    val json = Json { ignoreUnknownKeys = true }
+
     routing {
         head("/") { call.respond(HttpStatusCode.OK) }
         get("/") { call.respondText("OK") }
@@ -29,7 +42,6 @@ fun Application.configureRouting(llm: LlmClient) {
             val startedAt = runCatching {
                 application.attributes[AppAttributes.StartedAtMs]
             }.getOrElse {
-                // Если атрибут не установлен/недоступен — не падаем
                 System.currentTimeMillis()
             }
 
@@ -42,6 +54,16 @@ fun Application.configureRouting(llm: LlmClient) {
                     uptimeSec = uptimeSec
                 )
             )
+        }
+
+        // ✅ DB-specific health check
+        get("/health/db") {
+            val ok = db.query { conn ->
+                conn.prepareStatement("select 1").use { ps ->
+                    ps.executeQuery().use { rs -> rs.next() && rs.getInt(1) == 1 }
+                }
+            }
+            call.respond(mapOf("ok" to ok))
         }
 
         route("/v1") {
@@ -69,7 +91,6 @@ fun Application.configureRouting(llm: LlmClient) {
             }
 
             post("/assignments") {
-                // rate limit: teacher endpoint (по IP)
                 val ip = call.clientIp()
                 val rlOk = RateLimiter.allow(
                     key = "v1.assignments.create.ip=$ip",
@@ -83,7 +104,6 @@ fun Application.configureRouting(llm: LlmClient) {
                     return@post
                 }
 
-                // auth: teacher token
                 if (!TeacherAuth.isAllowed(call)) {
                     call.respond(
                         HttpStatusCode.Unauthorized,
@@ -93,26 +113,54 @@ fun Application.configureRouting(llm: LlmClient) {
                 }
 
                 val req = call.receive<CreateAssignmentReq>()
-                val assignment = AssignmentStore.create(
-                    topic = req.topic.trim(),
-                    vocab = req.vocab.map { it.trim() }.filter { it.isNotBlank() },
-                    level = req.level?.trim()?.ifBlank { null }
+                val topic = req.topic.trim()
+                val vocab = req.vocab.map { it.trim() }.filter { it.isNotBlank() }
+                val level = req.level?.trim()?.ifBlank { null }
+
+                // joinKey generation: same alphabet as before, but must be unique in DB
+                val joinKey = generateJoinKey()
+
+                val a = Assignment(
+                    id = UUID.randomUUID().toString(),
+                    joinKey = joinKey,
+                    topic = topic,
+                    vocab = vocab,
+                    level = level
                 )
 
-                call.respond(
-                    status = HttpStatusCode.Created,
-                    message = CreateAssignmentResp(
-                        assignmentId = assignment.id,
-                        joinKey = assignment.joinKey
-                    )
-                )
+                // If collision (unique join_key), retry a few times
+                var inserted = false
+                repeat(10) { attempt ->
+                    val keyToTry = if (attempt == 0) a.joinKey else generateJoinKey()
+                    val cur = a.copy(joinKey = keyToTry)
+                    inserted = runCatching {
+                        assignments.insert(cur)
+                        true
+                    }.getOrElse { e ->
+                        // naive check: unique violation -> retry, else rethrow
+                        val msg = e.message.orEmpty().lowercase()
+                        if (msg.contains("duplicate key") || msg.contains("unique")) false else throw e
+                    }
+                    if (inserted) {
+                        call.respond(
+                            status = HttpStatusCode.Created,
+                            message = CreateAssignmentResp(
+                                assignmentId = cur.id,
+                                joinKey = cur.joinKey
+                            )
+                        )
+                        return@post
+                    }
+                }
+
+                throw IllegalStateException("Failed to generate unique joinKey after retries")
             }
 
             get("/assignments/{id}") {
                 val assignmentId = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing assignment id")
 
-                val a = AssignmentStore.getById(assignmentId)
+                val a = assignments.getById(UUID.fromString(assignmentId))
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -138,7 +186,6 @@ fun Application.configureRouting(llm: LlmClient) {
             }
 
             post("/sessions/open") {
-                // rate limit: вход в сессию по joinKey (по IP)
                 val ip = call.clientIp()
                 val rlOk = RateLimiter.allow(
                     key = "v1.sessions.open.ip=$ip",
@@ -155,7 +202,7 @@ fun Application.configureRouting(llm: LlmClient) {
                 val req = call.receive<OpenSessionReq>()
                 val joinKey = req.joinKey.trim().uppercase()
 
-                val a = AssignmentStore.getByJoinKey(joinKey)
+                val a = assignments.getByJoinKey(joinKey)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -169,45 +216,54 @@ fun Application.configureRouting(llm: LlmClient) {
                         return@post
                     }
 
-                val session = SessionStore.createFromAssignment(a)
+                val sessionId = sessions.createFromAssignment(
+                    assignmentId = UUID.fromString(a.id),
+                    joinKey = a.joinKey,
+                    topic = a.topic,
+                    vocab = a.vocab,
+                    level = a.level
+                )
 
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
                 val t0 = System.nanoTime()
                 val opener = llm.generateOpener(
-                    topic = session.topic,
-                    vocab = session.vocab,
-                    level = session.level
+                    topic = a.topic,
+                    vocab = a.vocab,
+                    level = a.level
                 ).ifBlank {
                     "Let’s start with something simple—what comes to mind first?"
                 }
                 val tookMs = (System.nanoTime() - t0) / 1_000_000
 
                 application.log.info(
-                    "llm.generateOpener ok requestId=${call.callId} sessionId=${session.id} provider=$provider tookMs=$tookMs"
+                    "llm.generateOpener ok requestId=${call.callId} sessionId=$sessionId provider=$provider tookMs=$tookMs"
                 )
 
-                session.messages += Msg(role = "tutor", content = opener)
+                // persist opener as seq=1
+                db.tx { conn ->
+                    messages.appendInTx(conn, sessionId, role = "tutor", content = opener)
+                }
 
                 call.respond(
                     status = HttpStatusCode.Created,
                     message = OpenSessionResp(
-                        sessionId = session.id,
-                        assignmentId = session.assignmentId,
-                        joinKey = session.joinKey,
-                        topic = session.topic,
-                        messages = session.messages.map { MessageDto(it.role, it.content) }
+                        sessionId = sessionId.toString(),
+                        assignmentId = a.id,
+                        joinKey = a.joinKey,
+                        topic = a.topic,
+                        messages = listOf(MessageDto("tutor", opener))
                     )
                 )
             }
 
             post("/sessions/{id}/messages") {
-                val sessionId = call.parameters["id"]
+                val sessionIdStr = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
+                val sessionId = UUID.fromString(sessionIdStr)
 
-                // rate limit: основной "дорогой" эндпойнт (по IP+session)
                 val ip = call.clientIp()
                 val rlOk = RateLimiter.allow(
-                    key = "v1.sessions.messages.ip=$ip.session=$sessionId",
+                    key = "v1.sessions.messages.ip=$ip.session=$sessionIdStr",
                     policy = RateLimiter.Policy(limit = 60, windowMs = 60_000)
                 )
                 if (!rlOk) {
@@ -218,7 +274,8 @@ fun Application.configureRouting(llm: LlmClient) {
                     return@post
                 }
 
-                val session = SessionStore.get(sessionId)
+                // Ensure session exists (cheap)
+                val sessionSnapshot = sessions.getSessionSnapshot(sessionId)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -232,12 +289,11 @@ fun Application.configureRouting(llm: LlmClient) {
                         return@post
                     }
 
-                val idemKey = call.request.headers["Idempotency-Key"]?.trim().orEmpty()
-                    .ifBlank { null }
+                val idemKey = call.request.headers["Idempotency-Key"]?.trim().orEmpty().ifBlank { null }
 
-                // 1) Быстрый путь: если это повтор — отвечаем сразу, без лока и без LLM.
+                // 1) Fast path: already computed
                 if (idemKey != null) {
-                    val cached = IdempotencyStore.get(sessionId, idemKey)
+                    val cached = idem.get(sessionId, idemKey)
                     if (cached != null) {
                         call.respond(cached)
                         return@post
@@ -247,46 +303,47 @@ fun Application.configureRouting(llm: LlmClient) {
                 val req = call.receive<StudentMessageReq>()
                 val studentText = req.text.trim()
 
-                // Эти значения мы вычислим/соберём под локом, но отвечать будем вне лока.
-                var cachedUnderLock: TutorMessageResp? = null
-                var studentCorpus: String = ""
-                var usedEver: List<String> = emptyList()
-                var missingEver: List<String> = emptyList()
-                var studentTurns: Int = 0
+                // 2) If idempotency is provided: claim the key to avoid double LLM calls
+                if (idemKey != null) {
+                    val claimed = idem.claim(sessionId, idemKey)
+                    if (!claimed) {
+                        // someone else has it; try read again (maybe already completed)
+                        val cached = idem.get(sessionId, idemKey)
+                        if (cached != null) {
+                            call.respond(cached)
+                            return@post
+                        }
 
-                // 2) Под локом: защищаем историю и делаем "double-check" кэша.
-                session.withLock {
-                    if (idemKey != null) {
-                        cachedUnderLock = IdempotencyStore.get(sessionId, idemKey)
-                        if (cachedUnderLock != null) return@withLock
+                        // simplest safe behavior: tell client to retry later
+                        call.respond(
+                            HttpStatusCode.Conflict,
+                            ApiErrorEnvelope(
+                                ApiError(
+                                    code = ApiErrorCodes.BAD_REQUEST,
+                                    message = "Request with this Idempotency-Key is already in progress"
+                                )
+                            )
+                        )
+                        return@post
                     }
-
-                    session.messages += Msg(role = "student", content = studentText)
-
-                    studentCorpus = session.messages
-                        .asSequence()
-                        .filter { it.role == "student" }
-                        .joinToString("\n") { it.content }
-
-                    val (used, missing) = computeVocabCoverage(studentCorpus, session.vocab)
-                    usedEver = used
-                    missingEver = missing
-
-                    studentTurns = session.messages.count { it.role == "student" }
                 }
 
-                // Если под локом выяснили, что ответ уже есть — отдаём его (suspend вне лока).
-                if (cachedUnderLock != null) {
-                    call.respond(cachedUnderLock!!)
-                    return@post
+                // 3) Persist student message (tx ensures seq consistency)
+                db.tx { conn ->
+                    messages.appendInTx(conn, sessionId, role = "student", content = studentText)
                 }
 
-                // 3) Вне лока: вызываем LLM (suspend, может быть долгим).
+                // 4) Compute coverage from persisted history (student corpus)
+                val studentCorpus = messages.listStudentContents(sessionId).joinToString("\n")
+                val (usedEver, missingEver) = computeVocabCoverage(studentCorpus, sessionSnapshot.vocab)
+                val studentTurns = messages.countByRole(sessionId, role = "student")
+
+                // 5) Call LLM outside tx
                 val provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "ollama"
                 val t0 = System.nanoTime()
 
                 val tutorTextFromLlm = llm.tutorReply(
-                    session = session,
+                    session = sessionSnapshot, // snapshot (topic/vocab/messages)
                     studentText = studentText,
                     used = usedEver,
                     missing = missingEver
@@ -307,23 +364,25 @@ fun Application.configureRouting(llm: LlmClient) {
                     vocabMissing = missingEver
                 )
 
-                // 4) Под локом: дописываем tutor-сообщение и сохраняем идемпотентный результат.
-                session.withLock {
-                    session.messages += Msg(role = "tutor", content = tutor.tutorText)
-                    if (idemKey != null) {
-                        IdempotencyStore.put(sessionId, idemKey, tutor)
-                    }
+                // 6) Persist tutor message
+                db.tx { conn ->
+                    messages.appendInTx(conn, sessionId, role = "tutor", content = tutor.tutorText)
                 }
 
-                // 5) Ответ клиенту (suspend).
+                // 7) Complete idempotency (if used)
+                if (idemKey != null) {
+                    idem.complete(sessionId, idemKey, tutor)
+                }
+
                 call.respond(tutor)
             }
 
             get("/sessions/{id}") {
-                val sessionId = call.parameters["id"]
+                val sessionIdStr = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
+                val sessionId = UUID.fromString(sessionIdStr)
 
-                val session = SessionStore.get(sessionId)
+                val session = sessions.getSessionSnapshot(sessionId)
                     ?: run {
                         call.respond(
                             HttpStatusCode.NotFound,
@@ -356,25 +415,17 @@ fun Application.configureRouting(llm: LlmClient) {
                 if (limit !in 1..100) throw IllegalArgumentException("limit must be between 1 and 100")
                 if (offset < 0) throw IllegalArgumentException("offset must be >= 0")
 
-                val items = SessionStore.list(limit, offset).map { s ->
-                    SessionSummaryDto(
-                        sessionId = s.id,
-                        assignmentId = s.assignmentId,
-                        joinKey = s.joinKey,
-                        topic = s.topic,
-                        vocab = s.vocab,
-                        messageCount = s.messages.size
-                    )
-                }
+                val items = sessions.listSummaries(limit, offset)
 
                 call.respond(ListSessionsResp(items = items, limit = limit, offset = offset))
             }
 
             delete("/sessions/{id}") {
-                val sessionId = call.parameters["id"]
+                val sessionIdStr = call.parameters["id"]
                     ?: throw IllegalArgumentException("Missing session id")
+                val sessionId = UUID.fromString(sessionIdStr)
 
-                val deleted = SessionStore.delete(sessionId)
+                val deleted = sessions.delete(sessionId)
                 if (!deleted) {
                     call.respond(
                         HttpStatusCode.NotFound,
@@ -409,11 +460,20 @@ fun Application.configureRouting(llm: LlmClient) {
 }
 
 /**
+ * JoinKey generator (same alphabet as your old store).
+ */
+private fun generateJoinKey(length: Int = 6): String {
+    val alphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
+    val rng = java.security.SecureRandom()
+    return buildString(length) {
+        repeat(length) { append(alphabet[rng.nextInt(alphabet.length)]) }
+    }
+}
+
+/**
  * Phrase-aware покрытие лексики:
  * - если элемент без пробелов => матч по токенам
  * - если элемент с пробелами => матч фразы в нормализованном тексте
- *
- * Возвращает пару (used, missing) относительно переданного vocab.
  */
 private fun computeVocabCoverage(text: String, vocab: List<String>): Pair<List<String>, List<String>> {
     val normalized = normalizeForMatch(text)
@@ -448,9 +508,6 @@ private fun normalizeForMatch(s: String): String {
         .trim()
 }
 
-/**
- * Выбор подсказки: сначала связки (because/however/recommend), затем всё остальное.
- */
 private fun pickHint(missingEver: List<String>): String? {
     if (missingEver.isEmpty()) return null
 
