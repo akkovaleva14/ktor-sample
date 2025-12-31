@@ -52,5 +52,4 @@ dependencies {
 
     // Flyway migrations
     implementation("org.flywaydb:flyway-core:9.22.3")
-    implementation("org.flywaydb:flyway-database-postgresql:9.22.3")
 }
