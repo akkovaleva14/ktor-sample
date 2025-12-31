@@ -14,6 +14,19 @@ set next_seq = coalesce((
 ), 1);
 
 -- Safety: keep it >= 1
-alter table public.sessions
-    add constraint if not exists sessions_next_seq_positive_chk
-    check (next_seq >= 1);
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint c
+    join pg_class t on t.oid = c.conrelid
+    join pg_namespace n on n.oid = t.relnamespace
+    where c.conname = 'sessions_next_seq_positive_chk'
+      and n.nspname = 'public'
+      and t.relname = 'sessions'
+  ) then
+    alter table public.sessions
+      add constraint sessions_next_seq_positive_chk
+      check (next_seq >= 1);
+  end if;
+end $$;
