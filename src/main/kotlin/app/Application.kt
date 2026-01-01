@@ -296,6 +296,7 @@ fun Application.module(llmOverride: LlmPort? = null) {
     Routing.install(
         app = this,
         tx = tx,
+        llm = llm,
         createAssignment = createAssignment,
         getAssignment = getAssignment,
         openSession = openSession,
