@@ -66,41 +66,41 @@ object Routing {
 
             // DB-specific health check (kept simple)
             get("/health/db") {
-                val ok = tx.tx { true } // If tx can run, DB is up. (Deeper check can be in DB adapter.)
+                val ok = tx.tx { true }
                 call.respond(mapOf("ok" to ok))
             }
 
             route("/v1") {
 
-                /**
-                 * LLM health check (provider-level).
-                 *
-                 * Backward compatible with the previous probe:
-                 *   curl -sS -i "$BASE/v1/llm/ping"
-                 *
-                 * Semantics:
-                 * - 200 OK when provider is reachable & ready
-                 * - 503 Service Unavailable when provider check fails
-                 */
+                // LLM provider healthcheck
                 get("/llm/ping") {
-                    when (val res = llm.ping()) {
+                    // На всякий случай защищаемся от неожиданных исключений
+                    val res = runCatching { llm.ping() }.getOrElse { t ->
+                        LlmPingResult.Fail(
+                            provider = System.getenv("LLM_PROVIDER")?.lowercase() ?: "unknown",
+                            reason = t.message ?: (t::class.simpleName ?: "Unknown error"),
+                            httpStatus = null
+                        )
+                    }
+
+                    when (res) {
                         is LlmPingResult.Ok -> call.respond(
                             HttpStatusCode.OK,
-                            mapOf(
-                                "ok" to true,
-                                "provider" to res.provider,
-                                "latencyMs" to res.latency?.inWholeMilliseconds,
-                                "details" to res.details
+                            LlmPingResp(
+                                ok = true,
+                                provider = res.provider,
+                                latencyMs = res.latency?.inWholeMilliseconds,
+                                details = res.details
                             )
                         )
 
                         is LlmPingResult.Fail -> call.respond(
                             HttpStatusCode.ServiceUnavailable,
-                            mapOf(
-                                "ok" to false,
-                                "provider" to res.provider,
-                                "reason" to res.reason,
-                                "httpStatus" to res.httpStatus
+                            LlmPingResp(
+                                ok = false,
+                                provider = res.provider,
+                                reason = res.reason,
+                                httpStatus = res.httpStatus
                             )
                         )
                     }

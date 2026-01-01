@@ -11,14 +11,6 @@ data class HealthResp(
     val uptimeSec: Long
 )
 
-@Serializable
-data class LlmPingResp(
-    val status: String,
-    val provider: String,
-    val sample: String,
-    val tookMs: Long
-)
-
 // ---------- Teacher side: assignments ----------
 
 @Serializable
