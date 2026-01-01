@@ -7,6 +7,8 @@ import com.example.adapters.http.errors.ApiErrorEnvelope
 import com.example.adapters.http.util.clientIp
 import com.example.app.AppAttributes
 import com.example.core.model.TutorReply
+import com.example.core.ports.LlmPingResult
+import com.example.core.ports.LlmPort
 import com.example.core.ports.TxPort
 import com.example.core.usecase.*
 import io.ktor.http.*
@@ -31,6 +33,7 @@ object Routing {
     fun install(
         app: Application,
         tx: TxPort,
+        llm: LlmPort,
         createAssignment: CreateAssignmentUseCase,
         getAssignment: GetAssignmentUseCase,
         openSession: OpenSessionUseCase,
@@ -68,6 +71,40 @@ object Routing {
             }
 
             route("/v1") {
+
+                /**
+                 * LLM health check (provider-level).
+                 *
+                 * Backward compatible with the previous probe:
+                 *   curl -sS -i "$BASE/v1/llm/ping"
+                 *
+                 * Semantics:
+                 * - 200 OK when provider is reachable & ready
+                 * - 503 Service Unavailable when provider check fails
+                 */
+                get("/llm/ping") {
+                    when (val res = llm.ping()) {
+                        is LlmPingResult.Ok -> call.respond(
+                            HttpStatusCode.OK,
+                            mapOf(
+                                "ok" to true,
+                                "provider" to res.provider,
+                                "latencyMs" to res.latency?.inWholeMilliseconds,
+                                "details" to res.details
+                            )
+                        )
+
+                        is LlmPingResult.Fail -> call.respond(
+                            HttpStatusCode.ServiceUnavailable,
+                            mapOf(
+                                "ok" to false,
+                                "provider" to res.provider,
+                                "reason" to res.reason,
+                                "httpStatus" to res.httpStatus
+                            )
+                        )
+                    }
+                }
 
                 post("/assignments") {
                     val ip = call.clientIp()

@@ -1,6 +1,7 @@
 package com.example.adapters.llm.gigachat
 
 import com.example.core.model.Session
+import com.example.core.ports.LlmPingResult
 import com.example.core.ports.LlmPort
 import com.example.shared.UpstreamException
 import com.example.shared.snip
@@ -10,6 +11,7 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlin.time.TimeSource
 
 /**
  * LLM-клиент для GigaChat: генерирует стартовую реплику и ответы тьютора.
@@ -46,13 +48,63 @@ class GigaChatClient(
         }
     }
 
+    /**
+     * Быстрая проверка доступности GigaChat:
+     * - получаем валидный OAuth-токен
+     * - дергаем lightweight endpoint (/models), чтобы проверить авторизацию и доступность API
+     *
+     * Важно: ping НЕ должен кидать исключения наружу — возвращаем Ok/Fail.
+     */
+    override suspend fun ping(): LlmPingResult {
+        val provider = "gigachat"
+        val started = TimeSource.Monotonic.markNow()
+
+        return try {
+            val token = auth.getValidToken()
+
+            // Lightweight: список моделей
+            val resp: HttpResponse = http.get("https://gigachat.devices.sberbank.ru/api/v1/models") {
+                accept(ContentType.Application.Json)
+                header(HttpHeaders.Authorization, "Bearer $token")
+            }
+
+            val raw = runCatching { resp.bodyAsText() }.getOrDefault("")
+
+            if (!resp.status.isSuccess()) {
+                return LlmPingResult.Fail(
+                    provider = provider,
+                    reason = "HTTP ${resp.status.value}: ${raw.snip(200)}",
+                    httpStatus = resp.status.value
+                )
+            }
+
+            LlmPingResult.Ok(
+                provider = provider,
+                latency = started.elapsedNow(),
+                details = "models ok"
+            )
+        } catch (e: UpstreamException) {
+            LlmPingResult.Fail(
+                provider = provider,
+                reason = e.message ?: "UpstreamException",
+                httpStatus = e.status.value
+            )
+        } catch (t: Throwable) {
+            LlmPingResult.Fail(
+                provider = provider,
+                reason = t.message ?: (t::class.simpleName ?: "Unknown error"),
+                httpStatus = null
+            )
+        }
+    }
+
     override suspend fun generateOpener(topic: String, vocab: List<String>, level: String?): String {
         val system = """
-            Ты дружелюбный репетитор английского. Начни диалог мягко.
-            Правила:
-            - Верни ТОЛЬКО одну реплику тьютора.
-            - 1 короткое предложение + 1 простой вопрос.
-            - Не упоминай список слов напрямую.
+            You are a friendly English tutor. Start the conversation gently.
+            Rules:
+            - Return ONLY one tutor message.
+            - Ideally: 1 short sentence + 1 simple question.
+            - Do NOT mention the vocabulary list directly.
         """.trimIndent()
 
         val user = buildString {

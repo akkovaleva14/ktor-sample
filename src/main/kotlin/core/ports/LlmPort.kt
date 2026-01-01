@@ -1,6 +1,7 @@
 package com.example.core.ports
 
 import com.example.core.model.Session
+import kotlin.time.Duration
 
 /**
  * Абстракция над LLM-провайдерами (Ollama/GigaChat/…).
@@ -30,4 +31,26 @@ interface LlmPort {
         used: List<String>,
         missing: List<String>
     ): String
+
+    /**
+     * Быстрая проверка доступности провайдера:
+     * - сеть/эндпоинт
+     * - авторизация (если есть)
+     * - базовая готовность (например, модель доступна)
+     */
+    suspend fun ping(): LlmPingResult
+}
+
+sealed interface LlmPingResult {
+    data class Ok(
+        val provider: String,
+        val latency: Duration? = null,
+        val details: String? = null
+    ) : LlmPingResult
+
+    data class Fail(
+        val provider: String,
+        val reason: String,
+        val httpStatus: Int? = null
+    ) : LlmPingResult
 }

@@ -1,6 +1,7 @@
 package com.example.adapters.llm.ollama
 
 import com.example.core.model.Session
+import com.example.core.ports.LlmPingResult
 import com.example.core.ports.LlmPort
 import io.ktor.client.*
 import io.ktor.client.request.*
@@ -8,8 +9,10 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlin.time.TimeSource
 
 /**
  * LLM-клиент для Ollama (локальный режим).
@@ -31,6 +34,62 @@ class OllamaClient(
         val prompt: String,
         val stream: Boolean = false
     )
+
+    /**
+     * Быстрая проверка доступности Ollama:
+     * - сеть/эндпоинт (дергаем /api/tags)
+     * - проверяем, что нужная модель присутствует (иначе генерация всё равно упадёт)
+     *
+     * Важно: ping НЕ должен кидать исключения наружу — возвращаем Ok/Fail.
+     */
+    override suspend fun ping(): LlmPingResult {
+        val provider = "ollama"
+        val started = TimeSource.Monotonic.markNow()
+
+        return try {
+            val resp: HttpResponse = http.get("$baseUrl/api/tags") {
+                accept(ContentType.Application.Json)
+            }
+
+            val raw = resp.bodyAsText()
+
+            if (!resp.status.isSuccess()) {
+                return LlmPingResult.Fail(
+                    provider = provider,
+                    reason = "HTTP ${resp.status.value}",
+                    httpStatus = resp.status.value
+                )
+            }
+
+            // Ожидаем формат примерно такой:
+            // { "models": [ { "name": "qwen2.5:7b", ... }, ... ] }
+            val hasModel = runCatching {
+                val root = json.parseToJsonElement(raw).jsonObject
+                val models = root["models"]?.jsonArray ?: return@runCatching false
+                models.any { it.jsonObject["name"]?.jsonPrimitive?.content == model }
+            }.getOrDefault(false)
+
+            if (!hasModel) {
+                return LlmPingResult.Fail(
+                    provider = provider,
+                    reason = "Model not found in Ollama: $model",
+                    httpStatus = resp.status.value
+                )
+            }
+
+            LlmPingResult.Ok(
+                provider = provider,
+                latency = started.elapsedNow(),
+                details = "tags ok, model available"
+            )
+        } catch (t: Throwable) {
+            LlmPingResult.Fail(
+                provider = provider,
+                reason = t.message ?: (t::class.simpleName ?: "Unknown error"),
+                httpStatus = null
+            )
+        }
+    }
 
     override suspend fun generateOpener(topic: String, vocab: List<String>, level: String?): String {
         val prompt = buildString {
