@@ -1,24 +1,38 @@
 package com.example.app
 
+import com.example.adapters.http.*
 import com.example.adapters.http.Routing
 import com.example.app.wiring.AppWiring
 import com.example.core.policy.JoinKeyGenerator
 import com.example.core.ports.LlmPort
 import com.example.core.usecase.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
-import io.ktor.server.application.*
-import io.ktor.server.engine.*
-import io.ktor.server.netty.*
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.serialization.kotlinx.json.json
+import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationStopped
+import io.ktor.server.application.install
+import io.ktor.server.application.log
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.ContentTransformationException
-import io.ktor.server.plugins.callid.*
-import io.ktor.server.plugins.calllogging.*
-import io.ktor.server.plugins.contentnegotiation.*
-import io.ktor.server.plugins.requestvalidation.*
-import io.ktor.server.plugins.statuspages.*
-import io.ktor.server.response.*
-import kotlinx.coroutines.*
+import io.ktor.server.plugins.callid.CallId
+import io.ktor.server.plugins.callid.callId
+import io.ktor.server.plugins.calllogging.CallLogging
+import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.requestvalidation.RequestValidation
+import io.ktor.server.plugins.requestvalidation.RequestValidationException
+import io.ktor.server.plugins.requestvalidation.ValidationResult
+import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.response.respond
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import java.time.Duration
 import java.util.UUID
@@ -77,9 +91,7 @@ fun Application.module(llmOverride: LlmPort? = null) {
     val cleanupJob: Job? = if (idemCleanupEnabled) {
         log.info("Idempotency cleanup enabled: ttlDays=$idemTtlDays everyMin=$idemCleanupEveryMin")
 
-        // Ktor app coroutine scope
         CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-            // small initial delay to let app start
             delay(15_000)
 
             val ttl = Duration.ofDays(idemTtlDays)
@@ -114,7 +126,6 @@ fun Application.module(llmOverride: LlmPort? = null) {
 
     install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
 
-    // --- Validation: request DTOs live in adapters/http/dto ---
     install(RequestValidation) {
         validate<com.example.adapters.http.dto.CreateAssignmentReq> { req ->
             val topic = req.topic.trim()
@@ -147,7 +158,6 @@ fun Application.module(llmOverride: LlmPort? = null) {
         }
     }
 
-    // --- Errors mapping (HTTP adapter knows HTTP, core doesn't) ---
     install(StatusPages) {
         exception<RequestValidationException> { call, cause ->
             call.respond(
@@ -259,17 +269,16 @@ fun Application.module(llmOverride: LlmPort? = null) {
         }
     }
 
-    // --- Use cases (core) ---
-    val createAssignment = CreateAssignmentUseCase(
+    val createAssignmentUseCase = CreateAssignmentUseCase(
         assignments = dbPorts.assignments,
         teacherAuth = auth,
         rateLimiter = rate,
         joinKeyGen = JoinKeyGenerator.Default
     )
 
-    val getAssignment = GetAssignmentUseCase(dbPorts.assignments)
+    val getAssignmentUseCase = GetAssignmentUseCase(dbPorts.assignments)
 
-    val openSession = OpenSessionUseCase(
+    val openSessionUseCase = OpenSessionUseCase(
         assignments = dbPorts.assignments,
         sessions = dbPorts.sessions,
         messages = dbPorts.messages,
@@ -278,7 +287,7 @@ fun Application.module(llmOverride: LlmPort? = null) {
         rateLimiter = rate
     )
 
-    val postStudentMessage = PostStudentMessageUseCase(
+    val postStudentMessageUseCase = PostStudentMessageUseCase(
         sessions = dbPorts.sessions,
         messages = dbPorts.messages,
         idem = dbPorts.idem,
@@ -288,22 +297,49 @@ fun Application.module(llmOverride: LlmPort? = null) {
         clock = clock
     )
 
-    val getSession = GetSessionUseCase(dbPorts.sessions)
-    val listSessions = ListSessionsUseCase(dbPorts.sessions)
-    val deleteSession = DeleteSessionUseCase(dbPorts.sessions)
+    val getSessionUseCase = GetSessionUseCase(dbPorts.sessions)
+    val listSessionsUseCase = ListSessionsUseCase(dbPorts.sessions)
+    val deleteSessionUseCase = DeleteSessionUseCase(dbPorts.sessions)
 
-    // --- Routing adapter ---
     Routing.install(
         app = this,
         tx = tx,
         llm = llm,
-        createAssignment = createAssignment,
-        getAssignment = getAssignment,
-        openSession = openSession,
-        postStudentMessage = postStudentMessage,
-        getSession = getSession,
-        listSessions = listSessions,
-        deleteSession = deleteSession
+        createAssignment = object : CreateAssignment {
+            override fun execute(input: CreateAssignmentUseCase.Input): CreateAssignmentUseCase.Result {
+                return createAssignmentUseCase.execute(input)
+            }
+        },
+        getAssignment = object : GetAssignment {
+            override fun execute(id: UUID): GetAssignmentUseCase.Result {
+                return getAssignmentUseCase.execute(id)
+            }
+        },
+        openSession = object : OpenSession {
+            override suspend fun execute(input: OpenSessionUseCase.Input): OpenSessionUseCase.Result {
+                return openSessionUseCase.execute(input)
+            }
+        },
+        postStudentMessage = object : PostStudentMessage {
+            override suspend fun execute(input: PostStudentMessageUseCase.Input): PostStudentMessageUseCase.Result {
+                return postStudentMessageUseCase.execute(input)
+            }
+        },
+        getSession = object : GetSession {
+            override fun execute(id: UUID): GetSessionUseCase.Result {
+                return getSessionUseCase.execute(id)
+            }
+        },
+        listSessions = object : ListSessions {
+            override fun execute(limit: Int, offset: Int): List<com.example.core.model.SessionSummary> {
+                return listSessionsUseCase.execute(limit, offset)
+            }
+        },
+        deleteSession = object : DeleteSession {
+            override fun execute(id: UUID): Boolean {
+                return deleteSessionUseCase.execute(id)
+            }
+        }
     )
 
     monitor.subscribe(ApplicationStopped) {

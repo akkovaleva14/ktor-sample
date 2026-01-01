@@ -53,4 +53,19 @@ dependencies {
 
     // Flyway migrations
     implementation("org.flywaydb:flyway-core:9.22.3")
+
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
+}
+
+tasks.test {
+    useJUnitPlatform {
+        excludeTags("smoke")
+    }
+}
+
+tasks.register<Test>("smokeTest") {
+    useJUnitPlatform {
+        includeTags("smoke")
+    }
 }

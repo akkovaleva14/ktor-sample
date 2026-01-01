@@ -1,6 +1,18 @@
 package com.example.adapters.http
 
-import com.example.adapters.http.dto.*
+import com.example.adapters.http.dto.AssignmentDto
+import com.example.adapters.http.dto.CreateAssignmentReq
+import com.example.adapters.http.dto.CreateAssignmentResp
+import com.example.adapters.http.dto.HealthResp
+import com.example.adapters.http.dto.HistoryResp
+import com.example.adapters.http.dto.LlmPingResp
+import com.example.adapters.http.dto.ListSessionsResp
+import com.example.adapters.http.dto.MessageDto
+import com.example.adapters.http.dto.OpenSessionReq
+import com.example.adapters.http.dto.OpenSessionResp
+import com.example.adapters.http.dto.SessionSummaryDto
+import com.example.adapters.http.dto.StudentMessageReq
+import com.example.adapters.http.dto.TutorMessageResp
 import com.example.adapters.http.errors.ApiError
 import com.example.adapters.http.errors.ApiErrorCodes
 import com.example.adapters.http.errors.ApiErrorEnvelope
@@ -10,13 +22,25 @@ import com.example.core.model.TutorReply
 import com.example.core.ports.LlmPingResult
 import com.example.core.ports.LlmPort
 import com.example.core.ports.TxPort
-import com.example.core.usecase.*
-import io.ktor.http.*
-import io.ktor.server.application.*
+import com.example.core.usecase.CreateAssignmentUseCase
+import com.example.core.usecase.GetAssignmentUseCase
+import com.example.core.usecase.GetSessionUseCase
+import com.example.core.usecase.OpenSessionUseCase
+import com.example.core.usecase.PostStudentMessageUseCase
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.Application
+import io.ktor.server.application.call
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
-import io.ktor.server.routing.*
+import io.ktor.server.routing.delete
+import io.ktor.server.routing.get
+import io.ktor.server.routing.head
+import io.ktor.server.routing.post
+import io.ktor.server.routing.route
+import io.ktor.server.routing.routing
+import java.util.UUID
 
 /**
  * HTTP adapter.
@@ -34,13 +58,13 @@ object Routing {
         app: Application,
         tx: TxPort,
         llm: LlmPort,
-        createAssignment: CreateAssignmentUseCase,
-        getAssignment: GetAssignmentUseCase,
-        openSession: OpenSessionUseCase,
-        postStudentMessage: PostStudentMessageUseCase,
-        getSession: GetSessionUseCase,
-        listSessions: ListSessionsUseCase,
-        deleteSession: DeleteSessionUseCase
+        createAssignment: CreateAssignment,
+        getAssignment: GetAssignment,
+        openSession: OpenSession,
+        postStudentMessage: PostStudentMessage,
+        getSession: GetSession,
+        listSessions: ListSessions,
+        deleteSession: DeleteSession
     ) {
         app.routing {
             head("/") { call.respond(HttpStatusCode.OK) }
@@ -152,7 +176,7 @@ object Routing {
                     val assignmentId = call.parameters["id"]
                         ?: throw IllegalArgumentException("Missing assignment id")
 
-                    when (val res = getAssignment.execute(java.util.UUID.fromString(assignmentId))) {
+                    when (val res = getAssignment.execute(UUID.fromString(assignmentId))) {
                         GetAssignmentUseCase.Result.NotFound -> call.respond(
                             HttpStatusCode.NotFound,
                             ApiErrorEnvelope(
@@ -219,7 +243,7 @@ object Routing {
                 post("/sessions/{id}/messages") {
                     val sessionIdStr = call.parameters["id"]
                         ?: throw IllegalArgumentException("Missing session id")
-                    val sessionId = java.util.UUID.fromString(sessionIdStr)
+                    val sessionId = UUID.fromString(sessionIdStr)
 
                     val ip = call.clientIp()
                     val idemKey = call.request.headers["Idempotency-Key"]?.trim().orEmpty().ifBlank { null }
@@ -262,7 +286,7 @@ object Routing {
                 get("/sessions/{id}") {
                     val sessionIdStr = call.parameters["id"]
                         ?: throw IllegalArgumentException("Missing session id")
-                    val sessionId = java.util.UUID.fromString(sessionIdStr)
+                    val sessionId = UUID.fromString(sessionIdStr)
 
                     when (val res = getSession.execute(sessionId)) {
                         GetSessionUseCase.Result.NotFound -> call.respond(
@@ -312,7 +336,7 @@ object Routing {
                 delete("/sessions/{id}") {
                     val sessionIdStr = call.parameters["id"]
                         ?: throw IllegalArgumentException("Missing session id")
-                    val sessionId = java.util.UUID.fromString(sessionIdStr)
+                    val sessionId = UUID.fromString(sessionIdStr)
 
                     val deleted = deleteSession.execute(sessionId)
                     if (!deleted) {
