@@ -10,7 +10,7 @@ group = "com.example"
 version = "0.0.1"
 
 application {
-    mainClass.set("com.example.ApplicationKt")
+    mainClass.set("io.ktor.server.netty.EngineMain")
 }
 
 kotlin {
@@ -32,6 +32,7 @@ dependencies {
     implementation("io.ktor:ktor-server-call-logging-jvm:3.3.2")
     implementation("io.ktor:ktor-server-call-id-jvm:3.3.2")
     implementation("io.ktor:ktor-server-status-pages-jvm:3.3.2")
+    implementation("io.ktor:ktor-server-config-yaml:3.3.2")
 
     implementation("ch.qos.logback:logback-classic:1.5.16")
 
