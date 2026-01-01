@@ -13,6 +13,8 @@ import com.example.core.model.SessionSummary
 import com.example.core.ports.MessagesPort
 import com.example.core.ports.SessionsPort
 import java.util.UUID
+import com.example.adapters.db.jdbc.durationToPgInterval
+import java.time.Duration
 
 class SessionsRepoJdbc(
     private val session: JdbcSession,
@@ -112,6 +114,17 @@ class SessionsRepoJdbc(
                 vocab = vocabFromJson(rs.getString("vocab_text")),
                 messageCount = rs.getLong("message_count").toInt()
             )
+        }
+    }
+
+    override fun cleanupOlderThan(ttl: Duration): Int {
+        require(!ttl.isNegative && !ttl.isZero) { "ttl must be > 0" }
+
+        return session.query { conn ->
+            conn.prepared(
+                "delete from public.sessions where created_at < (now() - (?::interval))",
+                durationToPgInterval(ttl)
+            ).execUpdate()
         }
     }
 }

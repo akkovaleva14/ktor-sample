@@ -3,6 +3,7 @@ package com.example.core.ports
 import com.example.core.model.Session
 import com.example.core.model.SessionSummary
 import java.util.UUID
+import java.time.Duration
 
 interface SessionsPort {
     fun createFromAssignment(
@@ -21,4 +22,6 @@ interface SessionsPort {
 
     fun delete(sessionId: UUID): Boolean
     fun listSummaries(limit: Int, offset: Int): List<SessionSummary>
+
+    fun cleanupOlderThan(ttl: Duration): Int
 }

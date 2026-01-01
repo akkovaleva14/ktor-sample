@@ -38,12 +38,43 @@ import java.time.Duration
 import java.util.UUID
 
 fun main() {
+    val mode = System.getenv("APP_MODE")?.trim()?.lowercase() ?: "web"
+
+    if (mode == "maintenance") {
+        runMaintenanceOnce()
+        return
+    }
+
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     val host = System.getenv("HOST") ?: "0.0.0.0"
 
     embeddedServer(Netty, port = port, host = host) {
         module()
     }.start(wait = true)
+}
+
+private fun runMaintenanceOnce() {
+    val dataSource = Database.createDataSourceFromEnv()
+    try {
+        Database.migrate(dataSource)
+
+        val wiring = AppWiring(org.slf4j.LoggerFactory.getLogger("maintenance"))
+        val (jdbcSession, _) = wiring.createTx(dataSource)
+        val dbPorts = wiring.createDbPorts(jdbcSession)
+
+        val idemTtlDays = System.getenv("IDEMPOTENCY_TTL_DAYS")?.trim()?.toLongOrNull()?.coerceAtLeast(1) ?: 7L
+        val sessionsTtlDays = System.getenv("SESSIONS_TTL_DAYS")?.trim()?.toLongOrNull()?.coerceAtLeast(1) ?: 30L
+
+        val report = MaintenanceRunner(
+            jdbc = jdbcSession,
+            idempotency = dbPorts.idem,
+            sessions = dbPorts.sessions
+        ).run(idemTtlDays = idemTtlDays, sessionsTtlDays = sessionsTtlDays)
+
+        println("Maintenance finished: $report")
+    } finally {
+        runCatching { dataSource.close() }
+    }
 }
 
 /**
